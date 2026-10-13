@@ -18,6 +18,7 @@ Tone matters: this is a **helpful tool for fitters, not a monitoring tool**. Kee
 | `design/Build Mate prototype.dc.html` + `support.js` | The original prototype file (needs the design-system folder to render; reference only). |
 | `assets/winget-logo.png` | Winget logo (yellow on black), 900×186. |
 | `assets/fonts/` | Gotham Black (headings, weight 900) and Gotham Medium (body, weight 500). |
+| `screenshots/` | One image per main screen: sign-in, works orders, new works order, stage list, stage timer (running), end-of-day report. |
 | `CURSOR_PROMPT.md` | Ready-to-paste request for the next build stage (Supabase + evening email). |
 
 ## Fidelity
