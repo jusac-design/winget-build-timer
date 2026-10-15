@@ -625,7 +625,7 @@ function vTop() {
       <div class="me-wrap">
         <button class="me" data-a="togglemenu" title="${isOffice() ? 'Account' : 'Sign out'}"><span class="av">${esc(initials(S.fitter))}</span><span>${esc(S.fitter)}</span>${S.admin ? '<span class="admin-chip">Admin</span>' : S.supervisor ? '<span class="admin-chip">Supervisor</span>' : ''}</button>
         ${isOffice() && S.menu ? `<div class="me-menu">
-          <button data-a="admin">${S.admin ? 'Admin' : 'Supervisor'}</button>
+          <button data-a="admin">Admin</button>
           <button data-a="signout">Sign out</button>
         </div>` : ''}
       </div>
@@ -638,7 +638,7 @@ function vCrumbs() {
   const back = (S.screen === 'timer' || S.screen === 'finish') ? 'Back to stages' : 'Back to works orders';
   const c = [{l:'Works orders', a:'board'}];
   if (S.screen === 'new') c.push({l:'New works order'});
-  if (S.screen === 'admin') c.push({l: S.admin ? 'Admin' : 'Supervisor'});
+  if (S.screen === 'admin') c.push({l:'Admin'});
   if (o && ['stages','timer','finish'].includes(S.screen)) c.push({l:'WO ' + o.wo, a:'stages'});
   if (S.screen === 'timer') { const s = stageOf(S.stage); c.push({l:'Stage ' + s.n + ' · ' + s.name}); }
   if (S.screen === 'finish') c.push({l:'Finish job'});
@@ -841,9 +841,29 @@ function woVisible() {
   });
 }
 
+function vLiveNow() {
+  const live = woLiveJobs();
+  return `<div class="live-now">
+      <div class="lbl">Live now</div>
+      ${live.length ? `<div class="live-cards">${live.map(r => {
+        const stg = stageOf(r.active.stage);
+        const done = woStages(r);
+        const pct = Math.round(done * 10);
+        return `<button type="button" class="live-card" data-a="open" data-id="${esc(r.id)}">
+          <div class="live-top"><span class="wo">WO ${esc(r.wo)}</span><span class="status st-run">Running</span></div>
+          <div class="meta">${esc(r.customer || '—')} · ${esc(r.machine || '—')}</div>
+          <div class="live-who">On now: ${esc(r.active.fitter || '—')} · Stage ${r.active.stage}${stg ? ' · ' + esc(stg.name) : ''}</div>
+          <div class="live-time-lbl">Total WO time</div>
+          <div class="live-time">${hm(woLoggedMs(r) / 6e4)}</div>
+          <div class="small">${pct}% complete · ${done} of 10 stages</div>
+          <div class="bar"><i style="width:${pct}%"></i></div>
+        </button>`;
+      }).join('')}</div>` : `<div class="live-empty">No timers running.</div>`}
+    </div>`;
+}
+
 function vAdminOrders(tabs) {
   const rows = woVisible();
-  const live = woLiveJobs();
   const nSel = Object.keys(S.woSel).filter(id => S.woSel[id]).length;
   const selRows = (S.woList || []).filter(r => S.woSel[r.id]);
   const selMs = selRows.reduce((a, r) => a + woLoggedMs(r), 0);
@@ -853,29 +873,13 @@ function vAdminOrders(tabs) {
     <div class="board-head">
       <div>
         <h2 class="h2">Works orders</h2>
-        <div class="meta" style="margin-top:8px">Archive hides a job from the shop list. Delete removes it and its times. Tick rows to email a to-date total report.</div>
+        <div class="meta" style="margin-top:8px">${S.admin ? 'Archive hides a job from the shop list. Delete removes it and its times. Tick rows to email a to-date total report.' : 'All running jobs and the shop works order list. Archive hides a job from the shop. Tick rows to email a to-date total report.'}</div>
       </div>
       <div class="btns">
         <button class="pill pill-y" data-a="wototal" ${S.teamBusy || S.woSend === 'sending' ? 'disabled' : ''}>${S.woSend === 'sending' ? 'Sending…' : 'Email total report' + (nSel ? ' (' + nSel + ')' : '')}</button>
       </div>
     </div>
-    <div class="live-now">
-      <div class="lbl">Live now</div>
-      ${live.length ? `<div class="live-cards">${live.map(r => {
-        const stg = stageOf(r.active.stage);
-        const done = woStages(r);
-        const pct = Math.round(done * 10);
-        return `<div class="live-card">
-          <div class="live-top"><span class="wo">WO ${esc(r.wo)}</span><span class="status st-run">Running</span></div>
-          <div class="meta">${esc(r.customer || '—')} · ${esc(r.machine || '—')}</div>
-          <div class="live-who">On now: ${esc(r.active.fitter || '—')} · Stage ${r.active.stage}${stg ? ' · ' + esc(stg.name) : ''}</div>
-          <div class="live-time-lbl">Total WO time</div>
-          <div class="live-time">${hm(woLoggedMs(r) / 6e4)}</div>
-          <div class="small">${pct}% complete · ${done} of 10 stages</div>
-          <div class="bar"><i style="width:${pct}%"></i></div>
-        </div>`;
-      }).join('')}</div>` : `<div class="live-empty">No timers running.</div>`}
-    </div>
+    ${vLiveNow()}
     ${nSel ? `<div class="meta" style="margin:0 0 12px">Selected: ${nSel} job${nSel === 1 ? '' : 's'} · ${hm(selMs / 6e4)}</div>` : ''}
     <div class="btns" style="margin-bottom:14px">
       <button class="opt ${S.woFilter === 'shop' ? 'on' : ''}" data-a="wofilter" data-f="shop"><span>On shop</span></button>

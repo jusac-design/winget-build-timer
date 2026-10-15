@@ -128,7 +128,8 @@ a{color:var(--amber)}a:hover{color:var(--amber-dark)}
 .live-now{background:#fff;border:1px solid var(--g5);border-radius:16px;padding:14px 16px;margin:0 0 18px}
 .live-now .lbl{margin-bottom:10px}
 .live-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
-.live-card{padding:14px 16px;border:1px solid var(--g5);border-radius:14px;background:var(--bg)}
+.live-card{display:block;width:100%;padding:14px 16px;border:1px solid var(--g5);border-radius:14px;background:var(--bg);text-align:left;font:inherit;color:inherit;cursor:pointer}
+.live-card:hover{border-color:var(--g3)}
 .live-top{display:flex;align-items:center;gap:8px;margin-bottom:6px}
 .live-who{font:600 13px/1.4 var(--font);margin-top:8px}
 .live-time-lbl{font:700 9px/1 var(--font);letter-spacing:.1em;text-transform:uppercase;color:var(--g3);margin:12px 0 4px}
