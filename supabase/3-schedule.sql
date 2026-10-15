@@ -1,23 +1,19 @@
 -- ============================================================
 --  BUILD MATE — weekday 17:30 UK email
 --
---  Easiest (recommended): do this in the dashboard, not this file.
---    1. Left sidebar → Integrations → Cron
---    2. Create job
---    3. Name: build-mate-daily-report
---    4. Schedule (cron):  30 16,17 * * 1-5
---       (16:30 and 17:30 UTC, Mon–Fri. The function only sends
---        when the UK clock is 17:xx, so the email is 17:30 UK
---        in both winter and summer.)
---    5. Type: Supabase Edge Function
---    6. Function: daily-report
---    7. Method: POST
---    8. Body: {}
---    9. Save / Create job
+--  Live jobs (applied via MCP):
+--    build-mate-daily-report     30 16,17 * * 1-5   body {}
+--    build-mate-report-watchdog  0 17,18 * * 1-5    body {"watchdog":true}
+--    build-mate-close-timers     5 * * * 1-5        select close_open_timers()
+--  Send: UK 17:xx weekdays (including empty days). No weekends.
+--  Watchdog: UK 18:xx weekdays — emails admin if today's report did not send.
 --
---  If the dashboard has no "Edge Function" type, paste this SQL
---  instead (SQL Editor → New query → Run).
---  Replace YOUR-PROJECT-URL and YOUR-ANON-KEY first.
+--  Recreate only if the job is missing. Do not commit real keys.
+--    1. Left sidebar → Integrations → Cron, or run below in SQL
+--    2. Name: build-mate-daily-report
+--    3. Schedule:  30 16,17 * * 1-5
+--    4. POST YOUR-PROJECT-URL/functions/v1/daily-report
+--    5. Body: {}
 -- ============================================================
 
 create extension if not exists pg_cron;
