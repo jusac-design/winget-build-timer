@@ -1,7 +1,7 @@
 // ============================================================
 //  BUILD MATE — daily-report Edge Function
 //  Weekday 17:30 UK email (including empty days). No weekend sends.
-//  Send now (force) is admin-only.
+//  Send now (force) is supervisor or admin.
 //  At 18:00 UK, a watchdog alerts if the evening mail did not send.
 // ============================================================
 
@@ -151,11 +151,11 @@ Deno.serve(async (req) => {
     if (force) {
       const uid = sess.user?.id;
       if (!uid) return json({ error: "Sign in first." }, 401);
-      const me = await db.from("fitters").select("admin").eq("id", uid).maybeSingle();
+      const me = await db.from("fitters").select("admin, supervisor").eq("id", uid).maybeSingle();
       if (me.error) return json({ error: me.error.message }, 500);
-      if (!me.data?.admin) return json({ error: "Only an admin can send the report now." }, 403);
+      if (!me.data?.admin && !me.data?.supervisor) return json({ error: "Only a supervisor or admin can send the report now." }, 403);
     } else if (sess.user) {
-      return json({ error: "Only the evening schedule or an admin Send now can email the report." }, 403);
+      return json({ error: "Only the evening schedule or Send now can email the report." }, 403);
     }
 
     today = dayKey(new Date());

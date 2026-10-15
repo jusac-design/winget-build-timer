@@ -1,5 +1,6 @@
 // Build Mate — manage-team Edge Function
-// Admins only: add, edit, archive, restore, set passphrase.
+// Admin: full office, Settings, roles, delete WOs.
+// Supervisor: shop users, archive WOs, Live now / lists. No Settings, no delete WO, no role changes.
 import { createClient } from "npm:@supabase/supabase-js@2";
 
 const cors = {
@@ -23,9 +24,11 @@ Deno.serve(async (req) => {
   const uid = sess.user?.id;
   if (!uid) return json({ error: "Sign in first." }, 401);
 
-  const me = await db.from("fitters").select("id, admin").eq("id", uid).maybeSingle();
+  const me = await db.from("fitters").select("id, admin, supervisor").eq("id", uid).maybeSingle();
   if (me.error) return json({ error: me.error.message }, 500);
-  if (!me.data?.admin) return json({ error: "Only an admin can manage the team." }, 403);
+  const isAdmin = !!me.data?.admin;
+  const isSupervisor = !isAdmin && !!me.data?.supervisor;
+  if (!isAdmin && !isSupervisor) return json({ error: "You need supervisor or admin permission." }, 403);
 
   let body: Record<string, unknown> = {};
   try { body = await req.json(); } catch { return json({ error: "Missing request body." }, 400); }
@@ -34,10 +37,14 @@ Deno.serve(async (req) => {
   const full_name = String(body.full_name || "").trim();
   const email = String(body.email || "").trim().toLowerCase();
   const password = String(body.password || "");
-  const admin = body.admin === true;
+  const wantAdmin = isAdmin && body.admin === true;
+  const wantSupervisor = isAdmin && !wantAdmin && body.supervisor === true;
+
+  const officeRole = (row: { admin?: boolean; supervisor?: boolean } | null) =>
+    !!(row && (row.admin || row.supervisor));
 
   async function list() {
-    const { data, error } = await db.from("fitters").select("id, full_name, email, active, admin").order("full_name");
+    const { data, error } = await db.from("fitters").select("id, full_name, email, active, admin, supervisor").order("full_name");
     if (error) return json({ error: error.message }, 500);
     return json({ ok: true, fitters: data || [] });
   }
@@ -56,6 +63,10 @@ Deno.serve(async (req) => {
       updated_at: row.updated_at,
     }));
     return json({ ok: true, integrations });
+  }
+
+  if (action === "integrations_list" || action === "integrations_save" || action === "integrations_test") {
+    if (!isAdmin) return json({ error: "Only an admin can open Settings." }, 403);
   }
 
   if (action === "integrations_list") return listIntegrations();
@@ -140,6 +151,7 @@ Deno.serve(async (req) => {
   if (action === "orders_list") return listOrders();
 
   if (action === "order_archive" || action === "order_restore" || action === "order_delete") {
+    if (action === "order_delete" && !isAdmin) return json({ error: "Only an admin can delete a works order." }, 403);
     if (!id) return json({ error: "Pick a works order first." }, 400);
     const row = await db.from("orders").select("id, wo, active, archived").eq("id", id).maybeSingle();
     if (row.error) return json({ error: row.error.message }, 500);
@@ -164,6 +176,9 @@ Deno.serve(async (req) => {
     if (!full_name || !email || password.length < 8) {
       return json({ error: "Name, email and a passphrase of at least 8 characters are required." }, 400);
     }
+    if (!isAdmin && (wantAdmin || wantSupervisor || body.admin === true || body.supervisor === true)) {
+      return json({ error: "Only an admin can set Admin or Supervisor." }, 403);
+    }
     const created = await db.auth.admin.createUser({
       email,
       password,
@@ -172,21 +187,42 @@ Deno.serve(async (req) => {
     });
     if (created.error) return json({ error: created.error.message }, 400);
     const newId = created.data.user!.id;
-    const up = await db.from("fitters").upsert({ id: newId, full_name, email, active: true, admin });
+    const up = await db.from("fitters").upsert({
+      id: newId, full_name, email, active: true,
+      admin: wantAdmin, supervisor: wantSupervisor,
+    });
     if (up.error) return json({ error: up.error.message }, 500);
     return list();
   }
 
   if (!id) return json({ error: "Pick a person first." }, 400);
-  if (id === uid && (action === "archive" || (action === "update" && admin === false))) {
-    return json({ error: "You cannot archive or remove admin from your own login." }, 400);
+
+  const target = await db.from("fitters").select("id, admin, supervisor, full_name").eq("id", id).maybeSingle();
+  if (target.error) return json({ error: target.error.message }, 500);
+  if (!target.data) return json({ error: "That person was not found." }, 400);
+
+  if (!isAdmin && officeRole(target.data) && id !== uid) {
+    return json({ error: "A supervisor cannot change an Admin or Supervisor account." }, 403);
+  }
+  if (!isAdmin && id === uid && (action === "archive" || action === "restore")) {
+    return json({ error: "You cannot archive your own login." }, 400);
+  }
+
+  if (id === uid && (action === "archive" || (action === "update" && (body.admin === false || body.supervisor === false) && (me.data?.admin || me.data?.supervisor)))) {
+    return json({ error: "You cannot archive or remove your own office role." }, 400);
   }
 
   if (action === "update") {
     if (!full_name) return json({ error: "Name is required." }, 400);
+    if (!isAdmin && (body.admin === true || body.supervisor === true)) {
+      return json({ error: "Only an admin can set Admin or Supervisor." }, 403);
+    }
     const authUp = await db.auth.admin.updateUserById(id, { user_metadata: { full_name } });
     if (authUp.error) return json({ error: authUp.error.message }, 400);
-    const up = await db.from("fitters").update({ full_name, admin }).eq("id", id);
+    const patch = isAdmin
+      ? { full_name, admin: wantAdmin, supervisor: wantSupervisor }
+      : { full_name };
+    const up = await db.from("fitters").update(patch).eq("id", id);
     if (up.error) return json({ error: up.error.message }, 500);
     return list();
   }
@@ -201,8 +237,7 @@ Deno.serve(async (req) => {
   if (action === "archive") {
     const lastAdmin = await db.from("fitters").select("id").eq("admin", true).eq("active", true);
     if (!lastAdmin.error && (lastAdmin.data || []).length <= 1) {
-      const target = await db.from("fitters").select("admin").eq("id", id).maybeSingle();
-      if (target.data?.admin) return json({ error: "Keep at least one active admin." }, 400);
+      if (target.data.admin) return json({ error: "Keep at least one active admin." }, 400);
     }
     const up = await db.from("fitters").update({ active: false }).eq("id", id);
     if (up.error) return json({ error: up.error.message }, 500);

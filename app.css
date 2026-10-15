@@ -37,8 +37,8 @@ a{color:var(--amber)}a:hover{color:var(--amber-dark)}
 .sync.off{color:var(--yellow)}
 .runpill{display:flex;align-items:center;gap:14px;flex:1;min-width:0;min-height:72px;padding:10px 22px 10px 18px;background:var(--yellow);color:var(--ink);border:2px solid transparent;border-radius:999px;text-align:left}
 .runpill:hover{background:var(--yellow-hover)}
-.runpill.idle{background:transparent;color:#fff;border-color:rgba(255,255,255,.35)}
-.runpill.idle:hover{background:rgba(255,255,255,.08);border-color:#fff}
+.runpill.idle,.runpill.greet{background:transparent;color:#fff;border-color:rgba(255,255,255,.35)}
+.runpill.idle:hover,.runpill.greet:hover{background:rgba(255,255,255,.08);border-color:#fff}
 .runpill .dot{width:24px;height:24px;border-radius:50%;background:var(--green);animation:pulse 1.4s ease-in-out infinite;flex:none;box-shadow:0 0 0 6px rgba(0,150,57,.25)}
 .runpill.idle .dot{background:var(--red);box-shadow:0 0 0 6px rgba(225,31,28,.28)}
 .rp-txt,.rp-time{display:flex;flex-direction:column;gap:4px;min-width:0}

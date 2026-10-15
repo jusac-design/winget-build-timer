@@ -50,7 +50,7 @@ const sameDay = (a, b) => new Date(a).toDateString() === new Date(b).toDateStrin
 const TZ = 'Europe/London';
 function londonParts(ms) {
   const p = {};
-  new Intl.DateTimeFormat('en-GB', { timeZone: TZ, weekday: 'short', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })
+  new Intl.DateTimeFormat('en-GB', { timeZone: TZ, weekday: 'short', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
     .formatToParts(new Date(ms)).forEach(x => { if (x.type !== 'literal') p[x.type] = x.value; });
   return p;
 }
@@ -77,11 +77,22 @@ function shopClosed(ms) {
   if (p.weekday === 'Sat' || p.weekday === 'Sun') return true;
   return ms >= ukCloseAt(ms);
 }
+function greetingKind(ms) {
+  ms = ms == null ? Date.now() : ms;
+  const p = londonParts(ms);
+  if (p.weekday === 'Sat' || p.weekday === 'Sun') return null;
+  const secs = (+p.hour) * 3600 + (+p.minute) * 60 + (+p.second || 0);
+  if (secs >= 6 * 3600 && secs < 6 * 3600 + 3) return 'morning';
+  if (secs >= 17 * 3600 && secs < 17 * 3600 + 3) return 'night';
+  return null;
+}
 function applyCloseOfDay() {
   let n = 0;
   S.orders.forEach(o => {
     if (!o.active) return;
-    if (Date.now() < ukCloseAt(woActiveStart(o.active))) return;
+    const start = woActiveStart(o.active);
+    const close = ukCloseAt(start);
+    if (!start || start >= close || Date.now() < close) return;
     stopActive(o); touch(o); n++;
   });
   return n;
@@ -92,8 +103,8 @@ const BACK_ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" s
 
 // ---------- state ----------
 const S = {
-  screen:'signin', unlocked:false, handover:false, admin:false, menu:false, userId:null, fitter:null, picked:null, fitters:[], fittersError:'',
-  teamList:[], teamId:null, teamName:'', teamEmail:'', teamPass:'', teamAdmin:false, teamMsg:'', teamErr:'', teamBusy:false, teamForm:false,
+  screen:'signin', unlocked:false, handover:false, admin:false, supervisor:false, menu:false, userId:null, fitter:null, picked:null, fitters:[], fittersError:'',
+  teamList:[], teamId:null, teamName:'', teamEmail:'', teamPass:'', teamRole:'user', teamMsg:'', teamErr:'', teamBusy:false, teamForm:false,
   adminTab:'users', intList:[], intForm:false, intId:null, intFrom:'', intTo:'', intSecret:'', intTestTo:'',
   woList:[], woFilter:'shop', woQ:'', woSel:{}, woConfirm:null, woSend:'idle',
   orders:[], activeId:null, stage:1, unit:1,
@@ -127,27 +138,35 @@ function displayName(user) {
   return m.full_name || m.name || (S.picked && S.picked.full_name) || '';
 }
 
+function isOffice() { return !!(S.admin || S.supervisor); }
+function personRole(f) { return f.admin ? 'Admin' : f.supervisor ? 'Supervisor' : 'User'; }
+
 function goLocked() {
-  S.unlocked = false; S.handover = false; S.admin = false; S.menu = false; S.userId = null; S.fitter = null; S.picked = null; S.screen = 'signin'; S.activeId = null;
+  S.unlocked = false; S.handover = false; S.admin = false; S.supervisor = false; S.menu = false; S.userId = null; S.fitter = null; S.picked = null; S.screen = 'signin'; S.activeId = null;
   S.showReport = false; S.pass = ''; S.unlockBusy = false; S.unlockError = '';
-  S.teamList = []; S.teamId = null; S.teamForm = false; S.teamName = ''; S.teamEmail = ''; S.teamPass = ''; S.teamAdmin = false; S.teamMsg = ''; S.teamErr = '';
+  S.teamList = []; S.teamId = null; S.teamForm = false; S.teamName = ''; S.teamEmail = ''; S.teamPass = ''; S.teamRole = 'user'; S.teamMsg = ''; S.teamErr = '';
   S.adminTab = 'users'; S.intList = []; S.intForm = false; S.intId = null; S.intFrom = ''; S.intTo = ''; S.intSecret = ''; S.intTestTo = '';
   S.woList = []; S.woFilter = 'shop'; S.woQ = ''; S.woSel = {}; S.woConfirm = null; S.woSend = 'idle';
 }
 
 async function loadAdminFlag(user) {
-  S.admin = false; S.userId = user && user.id || null;
+  S.admin = false; S.supervisor = false; S.userId = user && user.id || null;
   if (!sb || !user) return;
-  const { data, error } = await sb.from('fitters').select('admin, full_name').eq('id', user.id).maybeSingle();
+  let { data, error } = await sb.from('fitters').select('admin, supervisor, full_name').eq('id', user.id).maybeSingle();
+  if (error) {
+    const retry = await sb.from('fitters').select('admin, full_name').eq('id', user.id).maybeSingle();
+    data = retry.data; error = retry.error;
+  }
   if (error) { console.warn(error); return; }
   if (data) {
     S.admin = !!data.admin;
+    S.supervisor = !S.admin && !!data.supervisor;
     if (data.full_name) S.fitter = data.full_name;
   }
 }
 
 async function teamCall(body) {
-  if (!sb || !S.admin) return;
+  if (!sb || !isOffice()) return;
   S.teamBusy = true; S.teamErr = ''; S.teamMsg = ''; render();
   try {
     const { data, error } = await sb.functions.invoke('manage-team', { body });
@@ -180,7 +199,7 @@ async function teamCall(body) {
       if (body.action === 'order_restore' || body.action === 'order_archive' || body.action === 'order_delete') await pull();
     }
     if (payload.message) S.teamMsg = payload.message;
-    if (body.action === 'create' || body.action === 'update') Object.assign(S, { teamForm:false, teamId:null, teamName:'', teamEmail:'', teamPass:'', teamAdmin:false });
+    if (body.action === 'create' || body.action === 'update') Object.assign(S, { teamForm:false, teamId:null, teamName:'', teamEmail:'', teamPass:'', teamRole:'user' });
     if (body.action === 'password') { S.teamPass = ''; S.teamMsg = S.teamMsg || 'Passphrase updated.'; }
     if (body.action === 'integrations_save') Object.assign(S, { intForm:false, intSecret:'' });
     const act = String(body.action || '');
@@ -279,10 +298,10 @@ window.addEventListener('offline', () => setSync('offline'));
 // ---------- maths ----------
 function loggedMs(o, n, unit) {
   let t = o.runs.filter(r => r.stage === n && (unit == null || r.unit === unit)).reduce((a, r) => a + (r.stop - r.start), 0);
-  if (o.active && o.active.stage === n && (unit == null || o.active.unit === unit)) t += Date.now() - o.active.start;
+  if (o.active && o.active.stage === n && (unit == null || o.active.unit === unit)) t += Date.now() - woActiveStart(o.active);
   return t;
 }
-function orderMs(o) { let t = o.runs.reduce((a, r) => a + (r.stop - r.start), 0); if (o.active) t += Date.now() - o.active.start; return t; }
+function orderMs(o) { let t = o.runs.reduce((a, r) => a + (r.stop - r.start), 0); if (o.active) t += Date.now() - woActiveStart(o.active); return t; }
 function mineLive() {
   const me = String(S.fitter || '').trim().toLowerCase();
   if (!me) return null;
@@ -291,7 +310,7 @@ function mineLive() {
 function todayMs(o, n) {
   const now = Date.now();
   let t = o.runs.filter(r => (n == null || r.stage === n) && sameDay(r.start, now)).reduce((a, r) => a + (r.stop - r.start), 0);
-  if (o.active && (n == null || o.active.stage === n)) t += now - o.active.start;
+  if (o.active && (n == null || o.active.stage === n)) t += now - woActiveStart(o.active);
   return t;
 }
 const perUnit = o => o.mode === 'unit' && o.qty > 1;
@@ -303,7 +322,7 @@ function stopActive(o) {
   const start = woActiveStart(o.active);
   const close = ukCloseAt(start);
   let stop = Date.now();
-  if (stop > close) stop = close;
+  if (start && start < close && stop > close) stop = close;
   const r = {id:uid('r'), stage:o.active.stage, unit:o.active.unit, fitter:o.active.fitter, start, stop};
   o.active = null;
   if (!start || stop <= start) return;
@@ -329,7 +348,7 @@ const actions = {
     if (S.userId && f.id !== S.userId && sb) {
       return (async () => {
         try { await sb.auth.signOut({ scope: 'local' }); } catch (e) {}
-        S.handover = false; S.unlocked = false; S.admin = false; S.userId = null; S.fitter = null;
+        S.handover = false; S.unlocked = false; S.admin = false; S.supervisor = false; S.userId = null; S.fitter = null;
         S.picked = f; S.screen = 'unlock';
         render();
       })();
@@ -375,28 +394,31 @@ const actions = {
     S.screen = 'signin'; S.picked = null; S.activeId = null;
   },
   signout: () => { lockShop(); },
-  togglemenu: () => { if (!S.admin) return actions.signout(); S.menu = !S.menu; },
+  togglemenu: () => { if (!isOffice()) return actions.signout(); S.menu = !S.menu; },
   admin: () => {
-    if (!S.admin) return;
+    if (!isOffice()) return;
     S.menu = false; S.screen = 'admin'; S.adminTab = 'users'; S.teamForm = false; S.teamId = null; S.teamErr = ''; S.teamMsg = '';
     S.intForm = false; S.intSecret = '';
     return teamCall({ action: 'list' });
   },
   admintab: d => {
-    if (!S.admin) return;
-    S.adminTab = d.tab || 'users'; S.teamForm = false; S.intForm = false; S.teamErr = ''; S.teamMsg = ''; S.woConfirm = null; S.woSend = 'idle';
+    if (!isOffice()) return;
+    let tab = d.tab || 'users';
+    if (tab === 'settings' && !S.admin) tab = 'users';
+    S.adminTab = tab; S.teamForm = false; S.intForm = false; S.teamErr = ''; S.teamMsg = ''; S.woConfirm = null; S.woSend = 'idle';
     if (S.adminTab === 'settings') return teamCall({ action: 'integrations_list' });
     if (S.adminTab === 'users') return teamCall({ action: 'list' });
     if (S.adminTab === 'orders') return teamCall({ action: 'orders_list' });
   },
   intedit: d => {
+    if (!S.admin) return;
     const row = S.intList.find(x => x.id === d.id); if (!row) return;
     const cfg = row.config || {};
     Object.assign(S, { intForm:true, intId:row.id, intFrom:cfg.from || '', intTo:cfg.to || '', intSecret:'', intTestTo:cfg.to || '', teamErr:'', teamMsg:'' });
   },
   intcancel: () => Object.assign(S, { intForm:false, intId:null, intFrom:'', intTo:'', intSecret:'', intTestTo:'' }),
   intsave: () => {
-    if (S.teamBusy || !S.intId) return;
+    if (!S.admin || S.teamBusy || !S.intId) return;
     return teamCall({ action:'integrations_save', id:S.intId, secret:S.intSecret, config:{ from:S.intFrom, to:S.intTo } });
   },
   wofilter: d => { S.woFilter = d.f || 'shop'; S.woConfirm = null; },
@@ -413,7 +435,7 @@ const actions = {
   woarchive: d => { if (S.teamBusy) return; S.woConfirm = null; return teamCall({ action: 'order_archive', id: d.id }); },
   worestore: d => { if (S.teamBusy) return; S.woConfirm = null; return teamCall({ action: 'order_restore', id: d.id }); },
   wodelete: d => {
-    if (S.teamBusy || !d.id) return;
+    if (!S.admin || S.teamBusy || !d.id) return;
     if (S.woConfirm !== d.id) { S.woConfirm = d.id; S.teamErr = ''; S.teamMsg = ''; return; }
     S.woConfirm = null;
     return teamCall({ action: 'order_delete', id: d.id });
@@ -422,7 +444,7 @@ const actions = {
   wototal: async () => {
     const ids = Object.keys(S.woSel).filter(id => S.woSel[id]);
     if (!ids.length) { S.teamErr = 'Tick one or more works orders, then Email total report.'; S.teamMsg = ''; return render(); }
-    if (!S.admin || !sb) return;
+    if (!isOffice() || !sb) return;
     S.teamBusy = true; S.woSend = 'sending'; S.teamErr = ''; S.teamMsg = 'Building the spreadsheet and sending…'; render();
     try {
       const { data, error } = await sb.functions.invoke('daily-report', { body: { force: true, ids } });
@@ -448,30 +470,39 @@ const actions = {
     render();
   },
   inttest: () => {
-    if (S.teamBusy || !S.intId) return;
+    if (!S.admin || S.teamBusy || !S.intId) return;
     const to = (S.intTestTo || '').trim();
     if (!to || to.indexOf('@') < 0) { S.teamErr = 'Enter a test email address.'; S.teamMsg = ''; return render(); }
     return teamCall({ action:'integrations_test', id:S.intId, secret:S.intSecret, from:S.intFrom, test_to:to });
   },
-  teamnew: () => Object.assign(S, { teamForm:true, teamId:null, teamName:'', teamEmail:'', teamPass:'', teamAdmin:false, teamErr:'', teamMsg:'' }),
-  teamcancel: () => Object.assign(S, { teamForm:false, teamId:null, teamName:'', teamEmail:'', teamPass:'', teamAdmin:false, teamErr:'', teamMsg:'' }),
+  teamnew: () => Object.assign(S, { teamForm:true, teamId:null, teamName:'', teamEmail:'', teamPass:'', teamRole:'user', teamErr:'', teamMsg:'' }),
+  teamcancel: () => Object.assign(S, { teamForm:false, teamId:null, teamName:'', teamEmail:'', teamPass:'', teamRole:'user', teamErr:'', teamMsg:'' }),
   teamedit: d => {
     const f = S.teamList.find(x => x.id === d.id); if (!f) return;
-    Object.assign(S, { teamForm:true, teamId:f.id, teamName:f.full_name, teamEmail:f.email, teamPass:'', teamAdmin:!!f.admin, teamErr:'', teamMsg:'' });
+    if (!S.admin && (f.admin || f.supervisor) && f.id !== S.userId) return;
+    Object.assign(S, { teamForm:true, teamId:f.id, teamName:f.full_name, teamEmail:f.email, teamPass:'', teamRole: f.admin ? 'admin' : f.supervisor ? 'supervisor' : 'user', teamErr:'', teamMsg:'' });
   },
-  teamadmin: () => { S.teamAdmin = !S.teamAdmin; },
+  teamrole: d => {
+    if (!S.admin || (S.teamId && S.teamId === S.userId)) return;
+    const role = d.role || d.r;
+    S.teamRole = role === 'admin' || role === 'supervisor' ? role : 'user';
+  },
+  teamsetrole: d => {
+    if (!S.admin || S.teamBusy) return;
+    const f = S.teamList.find(x => x.id === d.id); if (!f || f.id === S.userId) return;
+    const role = d.role || d.r;
+    return teamCall({ action:'update', id:f.id, full_name:f.full_name, admin: role === 'admin', supervisor: role === 'supervisor' });
+  },
   teamsave: () => {
     if (S.teamBusy) return;
-    if (S.teamId) return teamCall({ action:'update', id:S.teamId, full_name:S.teamName, admin:S.teamAdmin });
-    return teamCall({ action:'create', full_name:S.teamName, email:S.teamEmail, password:S.teamPass, admin:S.teamAdmin });
+    const admin = S.admin && S.teamRole === 'admin';
+    const supervisor = S.admin && S.teamRole === 'supervisor';
+    if (S.teamId) return teamCall({ action:'update', id:S.teamId, full_name:S.teamName, admin, supervisor });
+    return teamCall({ action:'create', full_name:S.teamName, email:S.teamEmail, password:S.teamPass, admin, supervisor });
   },
   teampass: () => { if (S.teamBusy || !S.teamId) return; return teamCall({ action:'password', id:S.teamId, password:S.teamPass }); },
   teamarchive: d => { if (S.teamBusy) return; return teamCall({ action:'archive', id:d.id }); },
   teamrestore: d => { if (S.teamBusy) return; return teamCall({ action:'restore', id:d.id }); },
-  teamtoggleadmin: d => {
-    const f = S.teamList.find(x => x.id === d.id); if (!f || S.teamBusy) return;
-    return teamCall({ action:'update', id:f.id, full_name:f.full_name, admin:!f.admin });
-  },
   board: () => { S.menu = false; S.screen = 'board'; },
   stages: () => { S.screen = 'stages'; },
   back: () => { S.screen = (S.screen === 'admin' || S.screen === 'team') ? 'board' : (S.screen === 'timer' || S.screen === 'finish') ? 'stages' : 'board'; },
@@ -498,7 +529,7 @@ const actions = {
     const o = cur(); if (!o) return;
     const running = o.active && o.active.stage === S.stage && (!perUnit(o) || o.active.unit === S.unit);
     stopActive(o);
-    if (!running && !shopClosed()) o.active = {stage:S.stage, unit:perUnit(o) ? S.unit : 1, fitter:S.fitter, start:Date.now()};
+    if (!running) o.active = {stage:S.stage, unit:perUnit(o) ? S.unit : 1, fitter:S.fitter, start:Date.now()};
     touch(o);
   },
   complete: () => {
@@ -519,7 +550,7 @@ const actions = {
   report: () => { S.showReport = true; S.sendState = 'idle'; S.sendMsg = ''; },
   closereport: () => { S.showReport = false; },
   send: async () => {
-    if (!S.admin) { S.sendState = 'error'; S.sendMsg = 'Only an admin can send the report.'; return render(); }
+    if (!isOffice()) { S.sendState = 'error'; S.sendMsg = 'Only a supervisor or admin can send the report.'; return render(); }
     if (!sb) { S.sendState = 'error'; S.sendMsg = 'Not connected to Supabase yet — add your keys to config.js.'; return; }
     S.sendState = 'sending'; S.sendMsg = 'Saving latest times…'; render();
     await flush();
@@ -556,12 +587,21 @@ function vTop() {
   const stageLine = live && live.active ? 'Stage ' + live.active.stage + (stg ? ' · ' + stg.name : '') : '';
   const sync = {local:['Device only',''], saved:['Saved',''], saving:['Saving…',''], offline:['Offline · will sync','off']}[S.sync];
   let pill;
+  const greet = !live ? greetingKind() : null;
+  const who = (S.fitter || '').trim();
   if (live) {
     pill = `<button class="runpill" data-a="open" data-id="${esc(live.id)}" title="Open this works order">
       <span class="dot"></span>
       <span class="rp-txt"><span class="rp-k">Live job</span><span class="rp-l">WO ${esc(live.wo)}${live.machine ? ' · ' + esc(live.machine) : ''}</span><span class="rp-s">${esc(stageLine)}</span></span>
       <span class="rp-time"><span class="rp-c">${hm(orderMs(live) / 6e4)}</span><span class="rp-k">Total WO time</span></span>
     </button>`;
+  } else if (greet && who) {
+    const open = inOrder
+      ? `data-a="open" data-id="${esc(o.id)}" title="Open this works order"`
+      : `data-a="board" title="Open the works order list"`;
+    pill = greet === 'morning'
+      ? `<button class="runpill greet" ${open}><span class="rp-txt"><span class="rp-k">Hello</span><span class="rp-l">${esc(who)}</span></span></button>`
+      : `<button class="runpill greet" ${open}><span class="rp-txt"><span class="rp-k">Goodnight</span><span class="rp-l">Thank you ${esc(who)}</span></span></button>`;
   } else if (inOrder) {
     pill = `<button class="runpill idle" data-a="open" data-id="${esc(o.id)}" title="Open this works order">
       <span class="dot"></span>
@@ -583,9 +623,9 @@ function vTop() {
     <div class="top-r">
       <span class="sync ${sync[1]}">${sync[0]}</span>
       <div class="me-wrap">
-        <button class="me" data-a="togglemenu" title="${S.admin ? 'Account' : 'Sign out'}"><span class="av">${esc(initials(S.fitter))}</span><span>${esc(S.fitter)}</span>${S.admin ? '<span class="admin-chip">Admin</span>' : ''}</button>
-        ${S.admin && S.menu ? `<div class="me-menu">
-          <button data-a="admin">Admin</button>
+        <button class="me" data-a="togglemenu" title="${isOffice() ? 'Account' : 'Sign out'}"><span class="av">${esc(initials(S.fitter))}</span><span>${esc(S.fitter)}</span>${S.admin ? '<span class="admin-chip">Admin</span>' : S.supervisor ? '<span class="admin-chip">Supervisor</span>' : ''}</button>
+        ${isOffice() && S.menu ? `<div class="me-menu">
+          <button data-a="admin">${S.admin ? 'Admin' : 'Supervisor'}</button>
           <button data-a="signout">Sign out</button>
         </div>` : ''}
       </div>
@@ -598,7 +638,7 @@ function vCrumbs() {
   const back = (S.screen === 'timer' || S.screen === 'finish') ? 'Back to stages' : 'Back to works orders';
   const c = [{l:'Works orders', a:'board'}];
   if (S.screen === 'new') c.push({l:'New works order'});
-  if (S.screen === 'admin') c.push({l:'Admin'});
+  if (S.screen === 'admin') c.push({l: S.admin ? 'Admin' : 'Supervisor'});
   if (o && ['stages','timer','finish'].includes(S.screen)) c.push({l:'WO ' + o.wo, a:'stages'});
   if (S.screen === 'timer') { const s = stageOf(S.stage); c.push({l:'Stage ' + s.n + ' · ' + s.name}); }
   if (S.screen === 'finish') c.push({l:'Finish job'});
@@ -640,17 +680,24 @@ function vSignin() {
 }
 
 function vAdmin() {
-  if (!S.admin) return '<div class="pad"><div class="empty">You need admin permission to open this page.</div></div>';
-  const tab = S.adminTab || 'users';
+  if (!isOffice()) return '<div class="pad"><div class="empty">You need supervisor or admin permission to open this page.</div></div>';
+  const tab = (!S.admin && S.adminTab === 'settings') ? 'users' : (S.adminTab || 'users');
   const tabs = `<div class="admin-tabs" role="tablist">
       <button class="atab users ${tab === 'users' ? 'on' : ''}" data-a="admintab" data-tab="users" role="tab" aria-selected="${tab === 'users'}">Users</button>
-      <button class="atab settings ${tab === 'settings' ? 'on' : ''}" data-a="admintab" data-tab="settings" role="tab" aria-selected="${tab === 'settings'}">Settings</button>
+      ${S.admin ? `<button class="atab settings ${tab === 'settings' ? 'on' : ''}" data-a="admintab" data-tab="settings" role="tab" aria-selected="${tab === 'settings'}">Settings</button>` : ''}
       <button class="atab later ${tab === 'orders' ? 'on' : ''}" data-a="admintab" data-tab="orders" role="tab" aria-selected="${tab === 'orders'}">Works orders</button>
     </div>`;
   if (tab === 'settings') return vAdminSettings(tabs);
   if (tab === 'orders') return vAdminOrders(tabs);
   const editing = !!S.teamId;
   const rows = S.teamList.slice().sort((a, b) => Number(b.active) - Number(a.active) || String(a.full_name).localeCompare(String(b.full_name)));
+  const roleLocked = editing && S.teamId === S.userId;
+  const roleBtns = S.admin ? `<div class="lbl" style="margin-top:14px">Role</div>
+      <div class="admin-fields">
+        <button class="opt ${S.teamRole === 'user' ? 'on' : ''}" data-a="teamrole" data-role="user" ${roleLocked ? 'disabled' : ''}><span>User</span><small>Shop floor only</small></button>
+        <button class="opt ${S.teamRole === 'supervisor' ? 'on' : ''}" data-a="teamrole" data-role="supervisor" ${roleLocked ? 'disabled' : ''}><span>Supervisor</span><small>Live now, users, archive WOs</small></button>
+        <button class="opt ${S.teamRole === 'admin' ? 'on' : ''}" data-a="teamrole" data-role="admin" ${roleLocked ? 'disabled' : ''}><span>Admin</span><small>Settings and roles</small></button>
+      </div>${roleLocked ? '<div class="meta" style="margin-top:8px">You cannot change your own role.</div>' : ''}` : '';
   return `<div class="scroll" data-scroll="admin"><div class="pad">
     ${tabs}
     <div class="board-head">
@@ -663,8 +710,8 @@ function vAdmin() {
         <input class="field" id="f-teamname" data-f="teamName" value="${esc(S.teamName)}" placeholder="Full name" autocomplete="off">
         <input class="field" id="f-teamemail" data-f="teamEmail" value="${esc(S.teamEmail)}" placeholder="Email" autocomplete="off" ${editing ? 'disabled' : ''}>
         <input class="field" id="f-teampass" data-f="teamPass" type="password" value="${esc(S.teamPass)}" placeholder="${editing ? 'New passphrase (optional)' : 'Passphrase (min 8 characters)'}" autocomplete="new-password">
-        <button class="opt ${S.teamAdmin ? 'on' : ''}" data-a="teamadmin" ${editing && S.teamId === S.userId ? 'disabled' : ''}><span>Admin</span><small>${S.teamAdmin ? 'Can open Admin' : 'Shop floor only'}</small></button>
       </div>
+      ${roleBtns}
       <div class="btns" style="margin-top:14px">
         <button class="pill pill-y" data-a="teamsave" ${S.teamBusy ? 'disabled' : ''}>${editing ? 'Save' : 'Add person'}</button>
         ${editing ? `<button class="pill pill-o" data-a="teampass" ${S.teamBusy ? 'disabled' : ''}>Reset passphrase</button>` : ''}
@@ -674,20 +721,27 @@ function vAdmin() {
     ${S.teamErr ? `<div class="unlock-err" style="margin:0 0 14px">${esc(S.teamErr)}</div>` : ''}
     ${S.teamMsg ? `<div class="meta" style="margin:0 0 14px;color:var(--green)">${esc(S.teamMsg)}</div>` : ''}
     ${rows.length ? `<div class="atbl">
-      <div class="atbl-h"><span>Name</span><span>Email</span><span>Status</span><span>Admin</span><span>Actions</span></div>
+      <div class="atbl-h"><span>Name</span><span>Email</span><span>Status</span><span>Role</span><span>Actions</span></div>
       ${rows.map(f => {
         const self = f.id === S.userId;
+        const locked = !S.admin && (f.admin || f.supervisor) && !self;
         return `<div class="atbl-r ${f.active ? '' : 'off'}">
           <span><b>${esc(f.full_name)}</b></span>
           <span>${esc(f.email)}</span>
           <span>${f.active ? 'Active' : 'Archived'}</span>
-          <span>${f.admin ? 'Yes' : 'No'}</span>
+          <span>${personRole(f)}</span>
           <span class="atbl-a">
-            <button class="pill pill-o atbl-b" data-a="teamedit" data-id="${esc(f.id)}">Edit</button>
+            <button class="pill pill-o atbl-b" data-a="teamedit" data-id="${esc(f.id)}" ${locked ? 'disabled' : ''}>Edit</button>
             ${f.active
-              ? `<button class="pill pill-o atbl-b" data-a="teamarchive" data-id="${esc(f.id)}" ${self || S.teamBusy ? 'disabled' : ''}>Archive</button>`
-              : `<button class="pill pill-o atbl-b" data-a="teamrestore" data-id="${esc(f.id)}" ${S.teamBusy ? 'disabled' : ''}>Restore</button>`}
-            <button class="pill pill-o atbl-b" data-a="teamtoggleadmin" data-id="${esc(f.id)}" ${self || S.teamBusy ? 'disabled' : ''}>${f.admin ? 'Remove admin' : 'Make admin'}</button>
+              ? `<button class="pill pill-o atbl-b" data-a="teamarchive" data-id="${esc(f.id)}" ${self || S.teamBusy || locked ? 'disabled' : ''}>Archive</button>`
+              : `<button class="pill pill-o atbl-b" data-a="teamrestore" data-id="${esc(f.id)}" ${S.teamBusy || locked ? 'disabled' : ''}>Restore</button>`}
+            ${S.admin && !self ? (f.supervisor
+              ? `<button class="pill pill-o atbl-b" data-a="teamsetrole" data-id="${esc(f.id)}" data-role="user" ${S.teamBusy ? 'disabled' : ''}>Remove supervisor</button>`
+              : f.admin
+                ? `<button class="pill pill-o atbl-b" data-a="teamsetrole" data-id="${esc(f.id)}" data-role="user" ${S.teamBusy ? 'disabled' : ''}>Remove admin</button>`
+                : `<button class="pill pill-o atbl-b" data-a="teamsetrole" data-id="${esc(f.id)}" data-role="supervisor" ${S.teamBusy ? 'disabled' : ''}>Make supervisor</button>
+                   <button class="pill pill-o atbl-b" data-a="teamsetrole" data-id="${esc(f.id)}" data-role="admin" ${S.teamBusy ? 'disabled' : ''}>Make admin</button>`)
+            : ''}
           </span>
         </div>`;
       }).join('')}
@@ -849,13 +903,13 @@ function vAdminOrders(tabs) {
           <span>${done} of 10 · ${done * 10}%</span>
           <span>${st}</span>
           <span class="atbl-a">
-            ${confirm ? `<span class="meta" style="flex:1 1 100%">Delete WO ${esc(r.wo)}? This cannot be undone.</span>
+            ${confirm && S.admin ? `<span class="meta" style="flex:1 1 100%">Delete WO ${esc(r.wo)}? This cannot be undone.</span>
               <button class="pill pill-y atbl-b" data-a="wodelete" data-id="${esc(r.id)}" ${S.teamBusy ? 'disabled' : ''}>Delete forever</button>
               <button class="pill pill-o atbl-b" data-a="wocanceldel">Cancel</button>`
             : `${r.archived
                 ? `<button class="pill pill-o atbl-b" data-a="worestore" data-id="${esc(r.id)}" ${S.teamBusy || running ? 'disabled' : ''}>Restore</button>`
                 : `<button class="pill pill-o atbl-b" data-a="woarchive" data-id="${esc(r.id)}" ${S.teamBusy || running ? 'disabled' : ''}>Archive</button>`}
-              <button class="pill pill-o atbl-b" data-a="wodelete" data-id="${esc(r.id)}" ${S.teamBusy || running ? 'disabled' : ''}>Delete</button>`}
+              ${S.admin ? `<button class="pill pill-o atbl-b" data-a="wodelete" data-id="${esc(r.id)}" ${S.teamBusy || running ? 'disabled' : ''}>Delete</button>` : ''}`}
           </span>
         </div>`;
       }).join('')}
@@ -958,8 +1012,10 @@ function vTimer(o) {
   const run = o.active && o.active.stage === s.n && (!pu || o.active.unit === S.unit);
   const done = o.complete.includes(s.n);
   const t = loggedMs(o, s.n, uf);
+  const liveStart = run ? woActiveStart(o.active) : 0;
   const runs = o.runs.filter(r => r.stage === s.n && (!pu || r.unit === S.unit));
   const ref = o.hasRef ? 'Reference ' + hm(s.ref) + '  ·  logged so far ' + hm(t / 6e4) : 'No reference time for this model  ·  logged so far ' + hm(t / 6e4);
+  const overtime = shopClosed() ? ' Overtime after 5pm still logs until you press Stop.' : '';
   return `<div class="timer">
     <div class="tmain">
       <div class="tfn" style="color:${s.colour}"><i style="background:${s.colour}"></i>Stage ${s.n} · ${s.fn}</div>
@@ -967,7 +1023,7 @@ function vTimer(o) {
       <div class="tsub">${esc('WO ' + o.wo + '  ·  ' + o.machine + (pu ? '  ·  Unit ' + S.unit + ' of ' + o.qty : ''))}</div>
       <div class="panel ${run ? 'run' : ''}">
         <div class="pl"><div class="lbl">${run ? 'Running now' : t > 0 ? 'Logged on this stage' : 'Not started'}</div>
-        <div class="clock">${run ? clock(Date.now() - o.active.start) : clock(t)}</div><div class="ref">${ref}</div></div>
+        <div class="clock">${run ? clock(Date.now() - liveStart) : clock(t)}</div><div class="ref">${ref}${overtime}</div></div>
         <button class="ss" data-a="toggle">${run ? 'Stop' : 'Start'}</button>
       </div>
       <button class="complete ${done ? 're' : ''}" data-a="complete">${done ? 'Reopen stage' : 'Mark stage complete'}</button>
@@ -976,7 +1032,7 @@ function vTimer(o) {
       <div class="tasks"><div class="lbl">Key tasks</div>${s.tasks.map(x => `<div class="task">${esc(x)}</div>`).join('')}</div>
       <div class="runs"><div class="runs-h"><span class="lbl">Runs</span><span>${runs.length + (run ? 1 : 0)} run${runs.length + (run ? 1 : 0) === 1 ? '' : 's'}</span></div>
         ${runs.map(r => `<div class="run"><span><b>${hhmm(r.start)} → ${hhmm(r.stop)}</b><small>${esc(r.fitter)}</small></span><strong>${hm((r.stop - r.start) / 6e4)}</strong></div>`).join('')}
-        ${run ? `<div class="run live"><span><b>${hhmm(o.active.start)} → running</b><small>${esc(o.active.fitter)}</small></span><strong>${hm((Date.now() - o.active.start) / 6e4)}</strong></div>` : ''}
+        ${run ? `<div class="run live"><span><b>${hhmm(liveStart)} → running</b><small>${esc(o.active.fitter)}</small></span><strong>${hm((Date.now() - liveStart) / 6e4)}</strong></div>` : ''}
         ${!runs.length && !run ? '<div class="muted">No time logged on this stage yet.</div>' : ''}
       </div>
     </div>
@@ -1020,7 +1076,7 @@ function vReport() {
     </div>
     <div class="sheet-f"><button class="pill pill-o" data-a="closereport">Close</button>
       <span class="msg ${S.sendState === 'error' ? 'err' : ''}" style="flex:1;text-align:right;white-space:pre-wrap">${esc(S.sendMsg)}</span>
-      ${S.admin ? `<button class="pill ${S.sendState === 'sent' ? 'pill-d' : 'pill-y'}" data-a="send" ${S.sendState === 'sending' ? 'disabled' : ''}>${btn}</button>` : ''}</div>
+      ${isOffice() ? `<button class="pill ${S.sendState === 'sent' ? 'pill-d' : 'pill-y'}" data-a="send" ${S.sendState === 'sending' ? 'disabled' : ''}>${btn}</button>` : ''}</div>
   </div></div>`;
 }
 
@@ -1032,7 +1088,7 @@ function view() {
   if (['stages','timer','finish'].includes(S.screen) && !o) S.screen = 'board';
   let body = '';
   if (S.screen === 'board') body = vBoard();
-  if (S.screen === 'admin') body = S.admin ? vAdmin() : (S.screen = 'board', vBoard());
+  if (S.screen === 'admin') body = isOffice() ? vAdmin() : (S.screen = 'board', vBoard());
   if (S.screen === 'new') body = vNew();
   if (S.screen === 'stages') body = vStages(o);
   if (S.screen === 'timer') body = vTimer(o);
@@ -1076,14 +1132,18 @@ root.addEventListener('input', e => {
 root.addEventListener('submit', e => { e.preventDefault(); if (S.screen === 'unlock') actions.unlock(); });
 root.addEventListener('keydown', e => { touchActivity(); });
 
+let greetShown = greetingKind();
 setInterval(() => {
   if (S.unlocked || S.handover) {
     if (applyCloseOfDay()) flush();
   }
   if (!S.unlocked) return;
+  const g = greetingKind();
+  const greetChanged = g !== greetShown;
+  greetShown = g;
   const liveShop = S.orders.some(o => o.active);
   const liveAdmin = S.screen === 'admin' && S.adminTab === 'orders' && ((S.woList || []).some(r => r.active) || S.orders.some(o => o.active));
-  if (liveShop || liveAdmin) render();
+  if (liveShop || liveAdmin || greetChanged) render();
 }, 1000);
 setInterval(() => { if (S.unlocked || S.handover) flush().then(pull); }, 60000);
 setInterval(checkIdle, 30000);
