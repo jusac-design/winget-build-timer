@@ -10,6 +10,51 @@ const cors = {
 const json = (b: unknown, status = 200) =>
   new Response(JSON.stringify(b), { status, headers: { ...cors, "Content-Type": "application/json" } });
 
+// Weekday shop breaks. Keep in step with app.js BREAKS.
+const BREAKS = [
+  { key: "morning", sh: 9, sm: 30, eh: 9, em: 45 },
+  { key: "lunch", sh: 12, sm: 30, eh: 13, em: 0 },
+  { key: "afternoon", sh: 15, sm: 0, eh: 15, em: 15 },
+];
+const TZ = "Europe/London";
+function londonParts(ms: number) {
+  const p: Record<string, string> = {};
+  new Intl.DateTimeFormat("en-GB", { timeZone: TZ, weekday: "short", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })
+    .formatToParts(new Date(ms)).forEach((x) => { if (x.type !== "literal") p[x.type] = x.value; });
+  return p;
+}
+function londonAt(y: number, m: number, d: number, hour: number, minute: number) {
+  let guess = Date.UTC(y, m - 1, d, hour, minute, 0);
+  for (let i = 0; i < 6; i++) {
+    const g = londonParts(guess);
+    const got = Date.UTC(+g.year, +g.month - 1, +g.day, +g.hour, +g.minute, +(g.second || 0));
+    const next = guess + (Date.UTC(y, m - 1, d, hour, minute, 0) - got);
+    if (next === guess) return guess;
+    guess = next;
+  }
+  return guess;
+}
+function countedMs(start: number, stop: number) {
+  if (!(stop > start)) return 0;
+  let deducted = 0;
+  const p0 = londonParts(start);
+  let y = +p0.year, mo = +p0.month, d = +p0.day;
+  for (let i = 0; i < 21; i++) {
+    if (londonAt(y, mo, d, 0, 0) >= stop) break;
+    const day = londonParts(londonAt(y, mo, d, 12, 0));
+    if (day.weekday !== "Sat" && day.weekday !== "Sun") {
+      for (const b of BREAKS) {
+        const a = Math.max(start, londonAt(y, mo, d, b.sh, b.sm));
+        const z = Math.min(stop, londonAt(y, mo, d, b.eh, b.em));
+        if (z > a) deducted += z - a;
+      }
+    }
+    const next = new Date(Date.UTC(y, mo - 1, d + 1));
+    y = next.getUTCFullYear(); mo = next.getUTCMonth() + 1; d = next.getUTCDate();
+  }
+  return Math.max(0, stop - start - deducted);
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
 
@@ -36,7 +81,7 @@ Deno.serve(async (req) => {
   const id = String(body.id || "");
   const full_name = String(body.full_name || "").trim();
   const email = String(body.email || "").trim().toLowerCase();
-  const password = String(body.password || "");
+  const password = String(body.password || "").trim();
   const wantAdmin = isAdmin && body.admin === true;
   const wantSupervisor = isAdmin && !wantAdmin && body.supervisor === true;
 
@@ -46,7 +91,42 @@ Deno.serve(async (req) => {
   async function list() {
     const { data, error } = await db.from("fitters").select("id, full_name, email, active, admin, supervisor").order("full_name");
     if (error) return json({ error: error.message }, 500);
-    return json({ ok: true, fitters: data || [] });
+    const rates = await db.from("fitter_rates").select("fitter_id, hourly_rate");
+    if (rates.error) return json({ error: rates.error.message }, 500);
+    const byId = new Map((rates.data || []).map((row) => [row.fitter_id, row.hourly_rate]));
+    const fitters = (data || []).map((row) => ({
+      ...row,
+      hourly_rate: byId.has(row.id) ? byId.get(row.id) : null,
+    }));
+    return json({ ok: true, fitters });
+  }
+
+  async function saveRate(fitterId: string, fullName: string, raw: unknown) {
+    if (raw === "" || raw === null) {
+      const del = await db.from("fitter_rates").delete().eq("fitter_id", fitterId);
+      return del.error ? del.error.message : null;
+    }
+    const n = Number(String(raw).replace(/£/g, "").trim());
+    if (!Number.isFinite(n) || n < 0 || n > 999.99) return "Hourly rate must be a number from 0 to 999.99.";
+    const hourly_rate = Math.round(n * 100) / 100;
+    const up = await db.from("fitter_rates").upsert({
+      fitter_id: fitterId,
+      hourly_rate,
+      updated_at: new Date().toISOString(),
+    });
+    if (up.error) return up.error.message;
+    const runs = await db.from("runs").select("id, fitter");
+    if (runs.error) return runs.error.message;
+    const key = fullName.trim().toLowerCase();
+    const ids = (runs.data || []).filter((r) => String(r.fitter || "").trim().toLowerCase() === key).map((r) => r.id);
+    if (!ids.length) return null;
+    const existing = await db.from("run_rates").select("run_id, hourly_rate").in("run_id", ids);
+    if (existing.error) return existing.error.message;
+    const filled = new Set((existing.data || []).filter((r) => r.hourly_rate != null).map((r) => r.run_id));
+    const missing = ids.filter((id) => !filled.has(id));
+    if (!missing.length) return null;
+    const ins = await db.from("run_rates").upsert(missing.map((run_id) => ({ run_id, hourly_rate })));
+    return ins.error ? ins.error.message : null;
   }
 
   if (action === "list") return list();
@@ -141,7 +221,7 @@ Deno.serve(async (req) => {
         const a = new Date(r.started_at).getTime();
         const b = new Date(r.stopped_at).getTime();
         if (!Number.isFinite(a) || !Number.isFinite(b) || b < a) continue;
-        logged[r.order_id] = (logged[r.order_id] || 0) + (b - a);
+        logged[r.order_id] = (logged[r.order_id] || 0) + countedMs(a, b);
       }
     }
     const orders = (data || []).map((row) => ({ ...row, logged_ms: logged[row.id] || 0 }));
@@ -192,6 +272,10 @@ Deno.serve(async (req) => {
       admin: wantAdmin, supervisor: wantSupervisor,
     });
     if (up.error) return json({ error: up.error.message }, 500);
+    if (isAdmin && Object.prototype.hasOwnProperty.call(body, "hourly_rate")) {
+      const rateErr = await saveRate(newId, full_name, body.hourly_rate);
+      if (rateErr) return json({ error: rateErr }, 400);
+    }
     return list();
   }
 
@@ -208,22 +292,29 @@ Deno.serve(async (req) => {
     return json({ error: "You cannot archive your own login." }, 400);
   }
 
-  if (id === uid && (action === "archive" || (action === "update" && (body.admin === false || body.supervisor === false) && (me.data?.admin || me.data?.supervisor)))) {
+  const removingOwnAdmin = !!(me.data?.admin && body.admin === false);
+  const removingOwnSupervisor = !!(me.data?.supervisor && !me.data?.admin && body.supervisor === false && body.admin !== true);
+  if (id === uid && (action === "archive" || (action === "update" && (removingOwnAdmin || removingOwnSupervisor)))) {
     return json({ error: "You cannot archive or remove your own office role." }, 400);
   }
 
   if (action === "update") {
     if (!full_name) return json({ error: "Name is required." }, 400);
+    if (password && password.length < 8) return json({ error: "Passphrase must be at least 8 characters." }, 400);
     if (!isAdmin && (body.admin === true || body.supervisor === true)) {
       return json({ error: "Only an admin can set Admin or Supervisor." }, 403);
     }
-    const authUp = await db.auth.admin.updateUserById(id, { user_metadata: { full_name } });
+    const authUp = await db.auth.admin.updateUserById(id, password ? { user_metadata: { full_name }, password } : { user_metadata: { full_name } });
     if (authUp.error) return json({ error: authUp.error.message }, 400);
     const patch = isAdmin
       ? { full_name, admin: wantAdmin, supervisor: wantSupervisor }
       : { full_name };
     const up = await db.from("fitters").update(patch).eq("id", id);
     if (up.error) return json({ error: up.error.message }, 500);
+    if (isAdmin && Object.prototype.hasOwnProperty.call(body, "hourly_rate")) {
+      const rateErr = await saveRate(id, full_name, body.hourly_rate);
+      if (rateErr) return json({ error: rateErr }, 400);
+    }
     return list();
   }
 

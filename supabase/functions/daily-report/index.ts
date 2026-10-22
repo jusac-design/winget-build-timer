@@ -49,6 +49,58 @@ const hm = (mins: number) => { const m = Math.round(mins); return `${Math.floor(
 const dec = (mins: number) => Math.round((mins / 60) * 100) / 100;
 const mins = (a: string, b: string) => (new Date(b).getTime() - new Date(a).getTime()) / 60000;
 
+// Weekday shop breaks. Keep in step with app.js BREAKS.
+const BREAKS = [
+  { key: "morning", name: "Morning break", sh: 9, sm: 30, eh: 9, em: 45 },
+  { key: "lunch", name: "Lunch", sh: 12, sm: 30, eh: 13, em: 0 },
+  { key: "afternoon", name: "Afternoon break", sh: 15, sm: 0, eh: 15, em: 15 },
+];
+function londonParts(ms: number) {
+  const p: Record<string, string> = {};
+  new Intl.DateTimeFormat("en-GB", { timeZone: TZ, weekday: "short", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })
+    .formatToParts(new Date(ms)).forEach((x) => { if (x.type !== "literal") p[x.type] = x.value; });
+  return p;
+}
+function londonAt(y: number, m: number, d: number, hour: number, minute: number) {
+  let guess = Date.UTC(y, m - 1, d, hour, minute, 0);
+  for (let i = 0; i < 6; i++) {
+    const g = londonParts(guess);
+    const got = Date.UTC(+g.year, +g.month - 1, +g.day, +g.hour, +g.minute, +(g.second || 0));
+    const next = guess + (Date.UTC(y, m - 1, d, hour, minute, 0) - got);
+    if (next === guess) return guess;
+    guess = next;
+  }
+  return guess;
+}
+function spanCount(startIso: string, stopIso: string) {
+  const start = new Date(startIso).getTime();
+  const stop = new Date(stopIso).getTime();
+  const elapsed = Math.max(0, stop - start);
+  if (!(stop > start)) return { elapsed: 0, counted: 0, breaks: [] as { key: string; name: string; ms: number }[] };
+  const acc: Record<string, number> = {};
+  const p0 = londonParts(start);
+  let y = +p0.year, mo = +p0.month, d = +p0.day;
+  for (let i = 0; i < 21; i++) {
+    if (londonAt(y, mo, d, 0, 0) >= stop) break;
+    const day = londonParts(londonAt(y, mo, d, 12, 0));
+    if (day.weekday !== "Sat" && day.weekday !== "Sun") {
+      for (const b of BREAKS) {
+        const a = Math.max(start, londonAt(y, mo, d, b.sh, b.sm));
+        const z = Math.min(stop, londonAt(y, mo, d, b.eh, b.em));
+        if (z > a) acc[b.key] = (acc[b.key] || 0) + (z - a);
+      }
+    }
+    const next = new Date(Date.UTC(y, mo - 1, d + 1));
+    y = next.getUTCFullYear(); mo = next.getUTCMonth() + 1; d = next.getUTCDate();
+  }
+  const breaks = BREAKS.filter((b) => acc[b.key]).map((b) => ({ key: b.key, name: b.name, ms: acc[b.key] }));
+  const deducted = breaks.reduce((s, b) => s + b.ms, 0);
+  return { elapsed, counted: Math.max(0, elapsed - deducted), breaks };
+}
+const hmShort = (min: number) => { const m = Math.max(0, Math.round(min)); return m < 60 ? `${m}m` : hm(m); };
+const breakLabel = (breaks: { name: string; ms: number }[]) => breaks.map((b) => `${b.name} −${hmShort(b.ms / 60000)}`).join(" · ");
+const money = (n: number) => Math.round(n * 100) / 100;
+
 type Db = ReturnType<typeof createClient>;
 
 async function resendMail(key: string, from: string, to: string, subject: string, html: string, attachments?: { filename: string; content: string }[]) {
@@ -208,6 +260,28 @@ Deno.serve(async (req) => {
         started_at: new Date(o.active.start).toISOString(), stopped_at: now.toISOString(), live: true });
     }
 
+    const runIds = allRuns.map((r) => r.id).filter((id) => id && id !== "live");
+    const [rateRows, fitterRateRows, fitterRows] = await Promise.all([
+      runIds.length ? db.from("run_rates").select("run_id, hourly_rate").in("run_id", runIds) : Promise.resolve({ data: [] as { run_id: string; hourly_rate: number | null }[], error: null }),
+      db.from("fitter_rates").select("fitter_id, hourly_rate"),
+      db.from("fitters").select("id, full_name"),
+    ]);
+    if (rateRows.error) throw new Error(rateRows.error.message);
+    if (fitterRateRows.error) throw new Error(fitterRateRows.error.message);
+    if (fitterRows.error) throw new Error(fitterRows.error.message);
+    const rateByRun = new Map((rateRows.data || []).map((row) => [row.run_id, row.hourly_rate == null ? null : Number(row.hourly_rate)]));
+    const rateByFitter = new Map((fitterRateRows.data || []).map((row) => [row.fitter_id, row.hourly_rate == null ? null : Number(row.hourly_rate)]));
+    const rateByName = new Map<string, number | null>();
+    for (const f of fitterRows.data || []) rateByName.set(String(f.full_name || "").trim().toLowerCase(), rateByFitter.get(f.id) ?? null);
+    const priced = (r: any) => {
+      const span = spanCount(r.started_at, r.stopped_at);
+      const rate = r.live
+        ? (rateByName.get(String(r.fitter || "").trim().toLowerCase()) ?? null)
+        : (rateByRun.has(r.id) ? rateByRun.get(r.id) ?? null : null);
+      const cost = span.counted > 0 && rate != null ? money((span.counted / 3600000) * Number(rate)) : null;
+      return { span, rate: rate == null ? null : Number(rate), cost, missing: span.counted > 0 && rate == null };
+    };
+
     const t1: unknown[][] = [[selectedReport ? "Build Mate — selected works orders" : "Build Mate — end of day report", "", "", today]];
     const emailRows: string[] = [];
     for (const o of orders.data ?? []) {
@@ -217,43 +291,64 @@ Deno.serve(async (req) => {
       t1.push([]);
       t1.push(["Works order", o.wo, "Customer", o.customer, "Machine", o.machine, "Qty", o.qty, "Status", status]);
       if (oNotes.length) t1.push(["Notes", oNotes.map((n: any) => `${n.text} (${n.fitter})`).join("  |  ")]);
-      t1.push(["#", "Function", "Process stage", "Today (Hr:Min)", "Today (hours)", "To date (Hr:Min)", "To date (hours)", "Reference (Hr:Min)"]);
-      let tToday = 0, tAll = 0;
+      t1.push(["#", "Function", "Process stage", "Today counted (Hr:Min)", "Today counted (hours)", "To date counted (Hr:Min)", "To date counted (hours)", "Break deducted", "Reference (Hr:Min)", "Cost"]);
+      let tToday = 0, tAll = 0, costAll = 0, costKnown = false, costMissing = false;
+      const breakAcc: Record<string, { name: string; ms: number }> = {};
       for (const s of STAGES) {
-        const sr = oRuns.filter((r) => r.stage === s.n);
-        const all = sr.reduce((a, r) => a + mins(r.started_at, r.stopped_at), 0);
-        const day = sr.filter((r) => dayKey(r.started_at) === today).reduce((a, r) => a + mins(r.started_at, r.stopped_at), 0);
+        const stageRuns = oRuns.filter((r) => r.stage === s.n);
+        const sr = stageRuns.map(priced);
+        const all = sr.reduce((a, r) => a + r.span.counted / 60000, 0);
+        const day = stageRuns.reduce((a, r, i) => a + (dayKey(r.started_at) === today ? sr[i].span.counted / 60000 : 0), 0);
+        const stageBreaks: Record<string, { name: string; ms: number }> = {};
+        sr.forEach((r) => r.span.breaks.forEach((b) => {
+          stageBreaks[b.key] = stageBreaks[b.key] || { name: b.name, ms: 0 };
+          stageBreaks[b.key].ms += b.ms;
+          breakAcc[b.key] = breakAcc[b.key] || { name: b.name, ms: 0 };
+          breakAcc[b.key].ms += b.ms;
+        }));
+        const stageCost = sr.reduce((a, r) => a + (r.cost || 0), 0);
+        const stageKnown = sr.some((r) => r.cost != null);
+        const stageMissing = sr.some((r) => r.missing);
+        if (stageKnown) { costAll += stageCost; costKnown = true; }
+        if (stageMissing) costMissing = true;
         tToday += day; tAll += all;
-        t1.push([s.n, s.fn, s.name, hm(day), dec(day), hm(all), dec(all), o.has_ref ? hm(s.ref) : "—"]);
+        const stageCostCell = stageKnown ? (stageMissing ? money(stageCost) + " + no rate" : money(stageCost)) : (stageMissing ? "No rate" : "");
+        t1.push([s.n, s.fn, s.name, hm(day), dec(day), hm(all), dec(all), breakLabel(Object.values(stageBreaks)), o.has_ref ? hm(s.ref) : "—", stageCostCell]);
       }
-      t1.push(["", "", "Works order total", hm(tToday), dec(tToday), hm(tAll), dec(tAll), o.has_ref ? hm(STAGES.reduce((a, s) => a + s.ref, 0)) : "—"]);
+      const ded = breakLabel(Object.values(breakAcc));
+      const costCell = costKnown ? (costMissing ? money(costAll) + " + no rate" : money(costAll)) : (costMissing ? "No rate" : "");
+      t1.push(["", "", "Works order total", hm(tToday), dec(tToday), hm(tAll), dec(tAll), ded, o.has_ref ? hm(STAGES.reduce((a, s) => a + s.ref, 0)) : "—", costCell]);
       if (o.has_ref) t1.push(["", "", "Fixed budget", "", "", hm(FIXED_BUDGET_100T), dec(FIXED_BUDGET_100T)]);
-      emailRows.push(`<tr><td style="padding:6px 10px;border-bottom:1px solid #e9eded"><b>WO ${o.wo}</b></td><td style="padding:6px 10px;border-bottom:1px solid #e9eded">${o.customer ?? ""}</td><td style="padding:6px 10px;border-bottom:1px solid #e9eded">${o.machine ?? ""}</td><td style="padding:6px 10px;border-bottom:1px solid #e9eded;text-align:right">${hm(tToday)}</td><td style="padding:6px 10px;border-bottom:1px solid #e9eded;text-align:right">${hm(tAll)}</td><td style="padding:6px 10px;border-bottom:1px solid #e9eded">${status}</td></tr>`);
+      emailRows.push(`<tr><td style="padding:6px 10px;border-bottom:1px solid #e9eded"><b>WO ${o.wo}</b></td><td style="padding:6px 10px;border-bottom:1px solid #e9eded">${o.customer ?? ""}</td><td style="padding:6px 10px;border-bottom:1px solid #e9eded">${o.machine ?? ""}</td><td style="padding:6px 10px;border-bottom:1px solid #e9eded;text-align:right">${hm(tToday)}</td><td style="padding:6px 10px;border-bottom:1px solid #e9eded;text-align:right">${hm(tAll)}</td><td style="padding:6px 10px;border-bottom:1px solid #e9eded;text-align:right">${costCell || "—"}</td><td style="padding:6px 10px;border-bottom:1px solid #e9eded">${status}</td></tr>`);
     }
     if (!(orders.data ?? []).length) t1.push([], ["No work was logged today."]);
 
     const byId = new Map((orders.data ?? []).map((o: any) => [o.id, o]));
-    const t2: unknown[][] = [["Works order", "Customer", "Machine", "Unit", "Stage #", "Process stage", "Function", "Fitter", "Start", "Stop", "Duration (Hr:Min)", "Duration (hours)", "Flag"]];
-    const fitterMins: Record<string, number> = {}, fnMins: Record<string, number> = {};
+    const t2: unknown[][] = [["Works order", "Customer", "Machine", "Unit", "Stage #", "Process stage", "Function", "Fitter", "Start", "Stop", "Gross (Hr:Min)", "Break deducted", "Counted (Hr:Min)", "Counted (hours)", "Rate", "Cost", "Flag"]];
+    const fitterMins: Record<string, number> = {}, fitterCost: Record<string, number> = {}, fitterMissing: Record<string, boolean> = {}, fnMins: Record<string, number> = {};
     for (const r of allRuns.filter((r) => selectedReport || dayKey(r.started_at) === today)) {
       const o: any = byId.get(r.order_id); const s = STAGES.find((x) => x.n === r.stage);
       if (!s) continue;
-      const m = mins(r.started_at, r.stopped_at);
-      fitterMins[r.fitter ?? "—"] = (fitterMins[r.fitter ?? "—"] ?? 0) + m;
-      fnMins[s.fn] = (fnMins[s.fn] ?? 0) + m;
-      t2.push([o?.wo, o?.customer, o?.machine, r.unit, s.n, s.name, s.fn, r.fitter, ukTime(r.started_at), (r as any).live ? "still running" : ukTime(r.stopped_at), hm(m), dec(m), (r as any).live ? "Timer was still running when the report was made" : ""]);
+      const p = priced(r);
+      const countedMin = p.span.counted / 60000;
+      const grossMin = p.span.elapsed / 60000;
+      fitterMins[r.fitter ?? "—"] = (fitterMins[r.fitter ?? "—"] ?? 0) + countedMin;
+      fnMins[s.fn] = (fnMins[s.fn] ?? 0) + countedMin;
+      if (p.cost != null) fitterCost[r.fitter ?? "—"] = (fitterCost[r.fitter ?? "—"] ?? 0) + p.cost;
+      if (p.missing) fitterMissing[r.fitter ?? "—"] = true;
+      t2.push([o?.wo, o?.customer, o?.machine, r.unit, s.n, s.name, s.fn, r.fitter, ukTime(r.started_at), (r as any).live ? "still running" : ukTime(r.stopped_at), hm(grossMin), breakLabel(p.span.breaks), hm(countedMin), dec(countedMin), p.rate == null ? "" : p.rate, p.cost == null ? (p.missing ? "No rate" : "") : p.cost, (r as any).live ? "Timer was still running when the report was made" : ""]);
     }
 
-    const t3: unknown[][] = [["Hours by fitter", "Hr:Min", "Hours"]];
-    Object.entries(fitterMins).sort().forEach(([k, v]) => t3.push([k, hm(v), dec(v)]));
-    t3.push([], ["Hours by function", "Hr:Min", "Hours"]);
+    const t3: unknown[][] = [["Hours by fitter", "Counted (Hr:Min)", "Counted (hours)", "Cost"]];
+    Object.entries(fitterMins).sort().forEach(([k, v]) => t3.push([k, hm(v), dec(v), fitterCost[k] != null ? (fitterMissing[k] ? money(fitterCost[k]) + " + no rate" : money(fitterCost[k])) : (fitterMissing[k] ? "No rate" : "")]));
+    t3.push([], ["Hours by function", "Counted (Hr:Min)", "Counted (hours)"]);
     ["Fabrication", "Stores", "Assembly", "Build", "QC"].forEach((f) => t3.push([f, hm(fnMins[f] ?? 0), dec(fnMins[f] ?? 0)]));
 
     const XLSX = xlsx();
     const wb = XLSX.utils.book_new();
-    const ws1 = XLSX.utils.aoa_to_sheet(t1); ws1["!cols"] = [{ wch: 14 }, { wch: 14 }, { wch: 34 }, { wch: 16 }, { wch: 14 }, { wch: 16 }, { wch: 14 }, { wch: 18 }, { wch: 10 }, { wch: 14 }];
-    const ws2 = XLSX.utils.aoa_to_sheet(t2); ws2["!cols"] = [{ wch: 12 }, { wch: 22 }, { wch: 18 }, { wch: 6 }, { wch: 8 }, { wch: 34 }, { wch: 12 }, { wch: 18 }, { wch: 8 }, { wch: 13 }, { wch: 16 }, { wch: 14 }, { wch: 40 }];
-    const ws3 = XLSX.utils.aoa_to_sheet(t3); ws3["!cols"] = [{ wch: 22 }, { wch: 10 }, { wch: 8 }];
+    const ws1 = XLSX.utils.aoa_to_sheet(t1); ws1["!cols"] = [{ wch: 22 }, { wch: 14 }, { wch: 34 }, { wch: 22 }, { wch: 18 }, { wch: 24 }, { wch: 20 }, { wch: 28 }, { wch: 18 }, { wch: 14 }];
+    const ws2 = XLSX.utils.aoa_to_sheet(t2); ws2["!cols"] = [{ wch: 12 }, { wch: 22 }, { wch: 18 }, { wch: 6 }, { wch: 8 }, { wch: 34 }, { wch: 12 }, { wch: 18 }, { wch: 8 }, { wch: 13 }, { wch: 16 }, { wch: 28 }, { wch: 16 }, { wch: 14 }, { wch: 8 }, { wch: 10 }, { wch: 40 }];
+    const ws3 = XLSX.utils.aoa_to_sheet(t3); ws3["!cols"] = [{ wch: 22 }, { wch: 18 }, { wch: 16 }, { wch: 14 }];
     XLSX.utils.book_append_sheet(wb, ws1, "Works order summary");
     XLSX.utils.book_append_sheet(wb, ws2, "Stage detail");
     XLSX.utils.book_append_sheet(wb, ws3, "Day totals");
@@ -262,8 +357,8 @@ Deno.serve(async (req) => {
 
     const html = `<div style="font-family:Arial,sans-serif;color:#373a36">
     <h2 style="margin:0 0 6px">Build Mate · ${selectedReport ? "selected works orders" : today}</h2>
-    <p style="margin:0 0 14px;color:#6e7a7b">${selectedReport ? "To-date build times for the works orders you selected." : "Today's build times are attached as an Excel workbook."}</p>
-    ${emailRows.length ? `<table style="border-collapse:collapse;font-size:13px"><tr style="background:#373a36;color:#fff"><th style="padding:6px 10px;text-align:left">Works order</th><th style="padding:6px 10px;text-align:left">Customer</th><th style="padding:6px 10px;text-align:left">Machine</th><th style="padding:6px 10px;text-align:right">Today</th><th style="padding:6px 10px;text-align:right">To date</th><th style="padding:6px 10px;text-align:left">Status</th></tr>${emailRows.join("")}</table>` : "<p>No work was logged today.</p>"}
+    <p style="margin:0 0 14px;color:#6e7a7b">${selectedReport ? "To-date counted build times for the works orders you selected. Weekday breaks are already taken off." : "Today's counted build times are attached as an Excel workbook. Weekday breaks are already taken off."}</p>
+    ${emailRows.length ? `<table style="border-collapse:collapse;font-size:13px"><tr style="background:#373a36;color:#fff"><th style="padding:6px 10px;text-align:left">Works order</th><th style="padding:6px 10px;text-align:left">Customer</th><th style="padding:6px 10px;text-align:left">Machine</th><th style="padding:6px 10px;text-align:right">Today counted</th><th style="padding:6px 10px;text-align:right">To date counted</th><th style="padding:6px 10px;text-align:right">Cost</th><th style="padding:6px 10px;text-align:left">Status</th></tr>${emailRows.join("")}</table>` : "<p>No work was logged today.</p>"}
   </div>`;
 
     const subject = selectedReport ? `Build Mate — selected works orders ${today}` : `Build Mate — build times ${today}`;

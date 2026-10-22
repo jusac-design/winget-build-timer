@@ -42,8 +42,11 @@ const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp
 const uid = p => p + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const initials = n => (n || '').split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase();
 const hm = mins => { const m = Math.round(mins); return Math.floor(m / 60) + 'h ' + String(m % 60).padStart(2, '0') + 'm'; };
+const hms = ms => { const s = Math.max(0, Math.floor(Number(ms) / 1000)); return Math.floor(s / 3600) + 'h ' + String(Math.floor(s / 60) % 60).padStart(2, '0') + 'm ' + String(s % 60).padStart(2, '0') + 's'; };
 const clock = ms => { const s = Math.max(0, Math.floor(ms / 1000)); return Math.floor(s / 3600) + ':' + String(Math.floor(s / 60) % 60).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0'); };
 const hhmm = ts => { const d = new Date(ts); return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); };
+const localInput = ts => { const d = new Date(ts); const p = n => String(n).padStart(2, '0'); return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + 'T' + p(d.getHours()) + ':' + p(d.getMinutes()); };
+const fromLocal = v => { const t = new Date(v).getTime(); return Number.isFinite(t) ? t : null; };
 const iso = ts => ts ? new Date(ts).toISOString() : null;
 const ms = v => v ? new Date(v).getTime() : null;
 const sameDay = (a, b) => new Date(a).toDateString() === new Date(b).toDateString();
@@ -54,22 +57,55 @@ function londonParts(ms) {
     .formatToParts(new Date(ms)).forEach(x => { if (x.type !== 'literal') p[x.type] = x.value; });
   return p;
 }
+function londonAt(y, m, d, hour, minute) {
+  let guess = Date.UTC(y, m - 1, d, hour, minute, 0);
+  for (let i = 0; i < 6; i++) {
+    const g = londonParts(guess);
+    const got = Date.UTC(+g.year, +g.month - 1, +g.day, +g.hour, +g.minute, +(g.second || 0));
+    const next = guess + (Date.UTC(y, m - 1, d, hour, minute, 0) - got);
+    if (next === guess) return guess;
+    guess = next;
+  }
+  return guess;
+}
 function ukCloseAt(startMs) {
   let t = Number(startMs) || Date.now();
   let p = londonParts(t);
   for (let i = 0; i < 4 && (p.weekday === 'Sat' || p.weekday === 'Sun'); i++) {
     t -= 864e5; p = londonParts(t);
   }
-  const y = +p.year, m = +p.month, d = +p.day;
-  let guess = Date.UTC(y, m - 1, d, 16, 0, 0);
-  for (let i = 0; i < 6; i++) {
-    const g = londonParts(guess);
-    const got = Date.UTC(+g.year, +g.month - 1, +g.day, +g.hour, +g.minute);
-    const next = guess + (Date.UTC(y, m - 1, d, 17, 0) - got);
-    if (next === guess) break;
-    guess = next;
+  return londonAt(+p.year, +p.month, +p.day, 16, 30);
+}
+// Weekday shop breaks. Keep these in step with the daily-report and manage-team functions.
+const BREAKS = [
+  {key:'morning', name:'Morning break', sh:9, sm:30, eh:9, em:45},
+  {key:'lunch', name:'Lunch', sh:12, sm:30, eh:13, em:0},
+  {key:'afternoon', name:'Afternoon break', sh:15, sm:0, eh:15, em:15}
+];
+function spanCount(start, stop) {
+  start = Number(start) || 0;
+  stop = Number(stop) || 0;
+  const elapsed = Math.max(0, stop - start);
+  if (stop <= start) return {elapsed:0, counted:0, breaks:[]};
+  const acc = {};
+  const p0 = londonParts(start);
+  let y = +p0.year, mo = +p0.month, d = +p0.day;
+  for (let i = 0; i < 21; i++) {
+    if (londonAt(y, mo, d, 0, 0) >= stop) break;
+    const day = londonParts(londonAt(y, mo, d, 12, 0));
+    if (day.weekday !== 'Sat' && day.weekday !== 'Sun') {
+      BREAKS.forEach(b => {
+        const a = Math.max(start, londonAt(y, mo, d, b.sh, b.sm));
+        const z = Math.min(stop, londonAt(y, mo, d, b.eh, b.em));
+        if (z > a) acc[b.key] = (acc[b.key] || 0) + (z - a);
+      });
+    }
+    const next = new Date(Date.UTC(y, mo - 1, d + 1));
+    y = next.getUTCFullYear(); mo = next.getUTCMonth() + 1; d = next.getUTCDate();
   }
-  return guess;
+  const breaks = BREAKS.filter(b => acc[b.key]).map(b => ({key:b.key, name:b.name, ms:acc[b.key]}));
+  const deducted = breaks.reduce((s, b) => s + b.ms, 0);
+  return {elapsed, counted:Math.max(0, elapsed - deducted), breaks};
 }
 function shopClosed(ms) {
   ms = ms == null ? Date.now() : ms;
@@ -104,9 +140,11 @@ const BACK_ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" s
 // ---------- state ----------
 const S = {
   screen:'signin', unlocked:false, handover:false, admin:false, supervisor:false, menu:false, userId:null, fitter:null, picked:null, fitters:[], fittersError:'',
-  teamList:[], teamId:null, teamName:'', teamEmail:'', teamPass:'', teamRole:'user', teamMsg:'', teamErr:'', teamBusy:false, teamForm:false,
-  adminTab:'users', intList:[], intForm:false, intId:null, intFrom:'', intTo:'', intSecret:'', intTestTo:'',
+  teamList:[], teamId:null, teamName:'', teamEmail:'', teamPass:'', teamRate:'', teamRole:'user', teamMsg:'', teamErr:'', teamBusy:false, teamForm:false,
+  rates:{}, runEdit:null, runStart:'', runStop:'', runErr:'', runDelete:null,
+  adminTab:'orders', intList:[], intForm:false, intId:null, intFrom:'', intTo:'', intSecret:'', intTestTo:'',
   woList:[], woFilter:'shop', woQ:'', woSel:{}, woConfirm:null, woSend:'idle',
+  boardFilter:'all', boardSort:'activity',
   orders:[], activeId:null, stage:1, unit:1,
   wo:'', cust:'', machine:null, qty:1, mode:'batch', newNote:'', noteDraft:'',
   pass:'', unlockError:'', unlockBusy:false,
@@ -144,9 +182,11 @@ function personRole(f) { return f.admin ? 'Admin' : f.supervisor ? 'Supervisor' 
 function goLocked() {
   S.unlocked = false; S.handover = false; S.admin = false; S.supervisor = false; S.menu = false; S.userId = null; S.fitter = null; S.picked = null; S.screen = 'signin'; S.activeId = null;
   S.showReport = false; S.pass = ''; S.unlockBusy = false; S.unlockError = '';
-  S.teamList = []; S.teamId = null; S.teamForm = false; S.teamName = ''; S.teamEmail = ''; S.teamPass = ''; S.teamRole = 'user'; S.teamMsg = ''; S.teamErr = '';
-  S.adminTab = 'users'; S.intList = []; S.intForm = false; S.intId = null; S.intFrom = ''; S.intTo = ''; S.intSecret = ''; S.intTestTo = '';
+  S.teamList = []; S.teamId = null; S.teamForm = false; S.teamName = ''; S.teamEmail = ''; S.teamPass = ''; S.teamRate = ''; S.teamRole = 'user'; S.teamMsg = ''; S.teamErr = '';
+  S.rates = {}; S.runEdit = null; S.runStart = ''; S.runStop = ''; S.runErr = ''; S.runDelete = null;
+  S.adminTab = 'orders'; S.intList = []; S.intForm = false; S.intId = null; S.intFrom = ''; S.intTo = ''; S.intSecret = ''; S.intTestTo = '';
   S.woList = []; S.woFilter = 'shop'; S.woQ = ''; S.woSel = {}; S.woConfirm = null; S.woSend = 'idle';
+  S.boardFilter = 'all'; S.boardSort = 'activity';
 }
 
 async function loadAdminFlag(user) {
@@ -199,8 +239,12 @@ async function teamCall(body) {
       if (body.action === 'order_restore' || body.action === 'order_archive' || body.action === 'order_delete') await pull();
     }
     if (payload.message) S.teamMsg = payload.message;
-    if (body.action === 'create' || body.action === 'update') Object.assign(S, { teamForm:false, teamId:null, teamName:'', teamEmail:'', teamPass:'', teamRole:'user' });
-    if (body.action === 'password') { S.teamPass = ''; S.teamMsg = S.teamMsg || 'Passphrase updated.'; }
+    if (body.action === 'create' || body.action === 'update') {
+      if (body.action === 'update' && body.id === S.userId && body.full_name) S.fitter = String(body.full_name).trim();
+      Object.assign(S, { teamForm:false, teamId:null, teamName:'', teamEmail:'', teamPass:'', teamRate:'', teamRole:'user' });
+    }
+    if (body.action === 'password') { S.teamPass = ''; S.teamMsg = S.teamMsg || 'Passphrase updated. They can sign in with it now.'; }
+    if (body.action === 'update' && body.password) S.teamMsg = 'Saved. They can sign in with the new passphrase.';
     if (body.action === 'integrations_save') Object.assign(S, { intForm:false, intSecret:'' });
     const act = String(body.action || '');
     if (!act.startsWith('integrations') && !act.startsWith('order')) await loadFitters();
@@ -240,8 +284,13 @@ async function checkIdle() {
 }
 
 function queue(table, row) {
-  if (table === 'orders') outbox = outbox.filter(x => !(x.t === 'orders' && x.row.id === row.id));
+  outbox = outbox.filter(x => !(x.t === table && ((x.row && x.row.id === row.id) || (x.op === 'delete' && x.id === row.id))));
   outbox.push({t:table, row});
+  save(); flush();
+}
+function queueDelete(table, id) {
+  outbox = outbox.filter(x => !(x.t === table && ((x.row && x.row.id === id) || (x.op === 'delete' && x.id === id))));
+  outbox.push({t:table, op:'delete', id});
   save(); flush();
 }
 function setSync(v) { if (S.sync !== v) { S.sync = v; render(); } }
@@ -259,7 +308,8 @@ async function flush() {
     outbox.sort((a, b) => (a.t === 'orders' ? 0 : 1) - (b.t === 'orders' ? 0 : 1));
     while (outbox.length) {
       const it = outbox[0];
-      const { error } = await sb.from(it.t).upsert(it.row);
+      const q = it.op === 'delete' ? sb.from(it.t).delete().eq('id', it.id) : sb.from(it.t).upsert(it.row);
+      const { error } = await q;
       if (error) throw error;
       outbox.shift(); save();
     }
@@ -281,11 +331,24 @@ async function pull() {
     if (r.error || n.error) return setSync('offline');
     runs = r.data; notes = n.data;
   }
+  let rateMap = {};
+  if (isOffice()) {
+    const fr = await sb.from('fitter_rates').select('fitter_id, hourly_rate');
+    if (!fr.error) {
+      S.rates = {};
+      (fr.data || []).forEach(row => { S.rates[row.fitter_id] = row.hourly_rate == null ? null : Number(row.hourly_rate); });
+    }
+    const runIds = runs.map(r => r.id);
+    if (runIds.length) {
+      const rr = await sb.from('run_rates').select('run_id, hourly_rate').in('run_id', runIds);
+      if (!rr.error) (rr.data || []).forEach(row => { rateMap[row.run_id] = row.hourly_rate == null ? null : Number(row.hourly_rate); });
+    }
+  }
   if (outbox.length) return; // something changed while loading — keep local
   S.orders = o.data.map(x => ({
     id:x.id, wo:x.wo, customer:x.customer, machine:x.machine, hasRef:x.has_ref, qty:x.qty, mode:x.mode,
     complete:x.complete || [], done:x.done, archived:!!x.archived, finishedAt:ms(x.finished_at), active:x.active, createdAt:ms(x.created_at),
-    runs: runs.filter(r => r.order_id === x.id).map(r => ({id:r.id, stage:r.stage, unit:r.unit, fitter:r.fitter, start:ms(r.started_at), stop:ms(r.stopped_at)})),
+    runs: runs.filter(r => r.order_id === x.id).map(r => ({id:r.id, stage:r.stage, unit:r.unit, fitter:r.fitter, start:ms(r.started_at), stop:ms(r.stopped_at), rate:Object.prototype.hasOwnProperty.call(rateMap, r.id) ? rateMap[r.id] : null})),
     notes: notes.filter(n => n.order_id === x.id).map(n => ({id:n.id, text:n.text, fitter:n.fitter, at:ms(n.created_at)})).sort((a, b) => a.at - b.at)
   })).sort((a, b) => a.createdAt - b.createdAt);
   applyCloseOfDay();
@@ -296,23 +359,65 @@ window.addEventListener('online', () => { loadFitters().then(() => { if (!S.unlo
 window.addEventListener('offline', () => setSync('offline'));
 
 // ---------- maths ----------
-function loggedMs(o, n, unit) {
-  let t = o.runs.filter(r => r.stage === n && (unit == null || r.unit === unit)).reduce((a, r) => a + (r.stop - r.start), 0);
-  if (o.active && o.active.stage === n && (unit == null || o.active.unit === unit)) t += Date.now() - woActiveStart(o.active);
-  return t;
+const hmShort = mins => { const m = Math.max(0, Math.round(mins)); return m < 60 ? m + 'm' : hm(m); };
+const gbp = n => '£' + (Math.round(n * 100) / 100).toFixed(2);
+function rateForName(name) {
+  const key = String(name || '').trim().toLowerCase();
+  if (!key) return null;
+  const f = (S.teamList || []).find(x => String(x.full_name || '').trim().toLowerCase() === key)
+    || (S.fitters || []).find(x => String(x.full_name || '').trim().toLowerCase() === key);
+  if (!f || S.rates[f.id] == null || S.rates[f.id] === '') return null;
+  const n = Number(S.rates[f.id]);
+  return Number.isFinite(n) ? n : null;
 }
-function orderMs(o) { let t = o.runs.reduce((a, r) => a + (r.stop - r.start), 0); if (o.active) t += Date.now() - woActiveStart(o.active); return t; }
+function collectRanges(o, n, unit, todayOnly) {
+  const now = Date.now();
+  const ranges = [];
+  (o.runs || []).forEach(r => {
+    if (n != null && r.stage !== n) return;
+    if (unit != null && r.unit !== unit) return;
+    if (todayOnly && !sameDay(r.start, now)) return;
+    ranges.push({start:r.start, stop:r.stop, rate:r.rate == null ? null : r.rate});
+  });
+  if (o.active && (n == null || o.active.stage === n) && (unit == null || o.active.unit === unit)) {
+    const start = woActiveStart(o.active);
+    if (start && (!todayOnly || sameDay(start, now))) ranges.push({start, stop:now, rate:rateForName(o.active.fitter)});
+  }
+  return ranges;
+}
+function tallyRanges(ranges) {
+  let elapsed = 0, counted = 0, cost = 0, known = 0, missing = 0;
+  const acc = {};
+  ranges.forEach(r => {
+    const p = spanCount(r.start, r.stop);
+    elapsed += p.elapsed; counted += p.counted;
+    p.breaks.forEach(b => { acc[b.key] = (acc[b.key] || 0) + b.ms; });
+    if (p.counted > 0) {
+      if (r.rate == null || r.rate === '') missing++;
+      else { known++; cost += (p.counted / 36e5) * Number(r.rate); }
+    }
+  });
+  const breaks = BREAKS.filter(b => acc[b.key]).map(b => ({key:b.key, name:b.name, ms:acc[b.key]}));
+  return {elapsed, counted, breaks, cost, known, missing};
+}
+function breakText(t) {
+  if (!t || !t.breaks.length) return '';
+  return t.breaks.map(b => b.name + ' −' + hmShort(b.ms / 6e4)).join(' · ');
+}
+function costText(t) {
+  if (!isOffice() || !t || (!t.known && !t.missing)) return '';
+  if (!t.known) return 'No rate';
+  if (t.missing) return gbp(t.cost) + ' · No rate on some time';
+  return gbp(t.cost);
+}
+function loggedMs(o, n, unit) { return tallyRanges(collectRanges(o, n, unit, false)).counted; }
+function orderMs(o) { return tallyRanges(collectRanges(o, null, null, false)).counted; }
 function mineLive() {
   const me = String(S.fitter || '').trim().toLowerCase();
   if (!me) return null;
   return S.orders.find(o => o.active && String(o.active.fitter || '').trim().toLowerCase() === me) || null;
 }
-function todayMs(o, n) {
-  const now = Date.now();
-  let t = o.runs.filter(r => (n == null || r.stage === n) && sameDay(r.start, now)).reduce((a, r) => a + (r.stop - r.start), 0);
-  if (o.active && (n == null || o.active.stage === n)) t += now - woActiveStart(o.active);
-  return t;
-}
+function todayMs(o, n) { return tallyRanges(collectRanges(o, n, null, true)).counted; }
 const perUnit = o => o.mode === 'unit' && o.qty > 1;
 
 // ---------- changes ----------
@@ -323,7 +428,7 @@ function stopActive(o) {
   const close = ukCloseAt(start);
   let stop = Date.now();
   if (start && start < close && stop > close) stop = close;
-  const r = {id:uid('r'), stage:o.active.stage, unit:o.active.unit, fitter:o.active.fitter, start, stop};
+  const r = {id:uid('r'), stage:o.active.stage, unit:o.active.unit, fitter:o.active.fitter, start, stop, rate:rateForName(o.active.fitter)};
   o.active = null;
   if (!start || stop <= start) return;
   o.runs.push(r); queue('runs', runRow(r, o));
@@ -388,23 +493,19 @@ const actions = {
     render();
     flush().then(pull);
   },
-  home: () => {
-    applyCloseOfDay();
-    S.handover = true; S.unlocked = false; S.menu = false; S.showReport = false;
-    S.screen = 'signin'; S.picked = null; S.activeId = null;
-  },
+  home: () => lockShop(),
   signout: () => { lockShop(); },
   togglemenu: () => { if (!isOffice()) return actions.signout(); S.menu = !S.menu; },
   admin: () => {
     if (!isOffice()) return;
-    S.menu = false; S.screen = 'admin'; S.adminTab = 'users'; S.teamForm = false; S.teamId = null; S.teamErr = ''; S.teamMsg = '';
+    S.menu = false; S.screen = 'admin'; S.adminTab = 'orders'; S.teamForm = false; S.teamId = null; S.teamErr = ''; S.teamMsg = '';
     S.intForm = false; S.intSecret = '';
-    return teamCall({ action: 'list' });
+    return teamCall({ action: 'orders_list' });
   },
   admintab: d => {
     if (!isOffice()) return;
-    let tab = d.tab || 'users';
-    if (tab === 'settings' && !S.admin) tab = 'users';
+    let tab = d.tab || 'orders';
+    if (tab === 'settings' && !S.admin) tab = 'orders';
     S.adminTab = tab; S.teamForm = false; S.intForm = false; S.teamErr = ''; S.teamMsg = ''; S.woConfirm = null; S.woSend = 'idle';
     if (S.adminTab === 'settings') return teamCall({ action: 'integrations_list' });
     if (S.adminTab === 'users') return teamCall({ action: 'list' });
@@ -475,12 +576,13 @@ const actions = {
     if (!to || to.indexOf('@') < 0) { S.teamErr = 'Enter a test email address.'; S.teamMsg = ''; return render(); }
     return teamCall({ action:'integrations_test', id:S.intId, secret:S.intSecret, from:S.intFrom, test_to:to });
   },
-  teamnew: () => Object.assign(S, { teamForm:true, teamId:null, teamName:'', teamEmail:'', teamPass:'', teamRole:'user', teamErr:'', teamMsg:'' }),
-  teamcancel: () => Object.assign(S, { teamForm:false, teamId:null, teamName:'', teamEmail:'', teamPass:'', teamRole:'user', teamErr:'', teamMsg:'' }),
+  teamnew: () => Object.assign(S, { teamForm:true, teamId:null, teamName:'', teamEmail:'', teamPass:'', teamRate:'', teamRole:'user', teamErr:'', teamMsg:'' }),
+  teamcancel: () => Object.assign(S, { teamForm:false, teamId:null, teamName:'', teamEmail:'', teamPass:'', teamRate:'', teamRole:'user', teamErr:'', teamMsg:'' }),
   teamedit: d => {
     const f = S.teamList.find(x => x.id === d.id); if (!f) return;
     if (!S.admin && (f.admin || f.supervisor) && f.id !== S.userId) return;
-    Object.assign(S, { teamForm:true, teamId:f.id, teamName:f.full_name, teamEmail:f.email, teamPass:'', teamRole: f.admin ? 'admin' : f.supervisor ? 'supervisor' : 'user', teamErr:'', teamMsg:'' });
+    const rate = f.hourly_rate == null || f.hourly_rate === '' ? '' : String(f.hourly_rate);
+    Object.assign(S, { teamForm:true, teamId:f.id, teamName:f.full_name, teamEmail:f.email, teamPass:'', teamRate:rate, teamRole: f.admin ? 'admin' : f.supervisor ? 'supervisor' : 'user', teamErr:'', teamMsg:'' });
   },
   teamrole: d => {
     if (!S.admin || (S.teamId && S.teamId === S.userId)) return;
@@ -495,18 +597,32 @@ const actions = {
   },
   teamsave: () => {
     if (S.teamBusy) return;
+    const passBox = document.getElementById('f-teampass');
+    if (passBox) S.teamPass = passBox.value;
+    const password = String(S.teamPass || '').trim();
+    S.teamPass = password;
     const admin = S.admin && S.teamRole === 'admin';
     const supervisor = S.admin && S.teamRole === 'supervisor';
-    if (S.teamId) return teamCall({ action:'update', id:S.teamId, full_name:S.teamName, admin, supervisor });
-    return teamCall({ action:'create', full_name:S.teamName, email:S.teamEmail, password:S.teamPass, admin, supervisor });
+    if (S.teamId) {
+      if (password && password.length < 8) { S.teamErr = 'A new passphrase needs at least 8 characters, or leave it blank to keep the current one.'; S.teamMsg = ''; return render(); }
+      return teamCall(Object.assign({ action:'update', id:S.teamId, full_name:S.teamName, admin, supervisor }, password ? { password } : {}, S.admin ? { hourly_rate:String(S.teamRate || '').trim() } : {}));
+    }
+    return teamCall(Object.assign({ action:'create', full_name:S.teamName, email:S.teamEmail, password, admin, supervisor }, S.admin ? { hourly_rate:String(S.teamRate || '').trim() } : {}));
   },
-  teampass: () => { if (S.teamBusy || !S.teamId) return; return teamCall({ action:'password', id:S.teamId, password:S.teamPass }); },
+  teampass: () => {
+    if (S.teamBusy || !S.teamId) return;
+    const box = document.getElementById('f-teampass');
+    const password = ((box && box.value) || S.teamPass || '').trim();
+    S.teamPass = password;
+    if (password.length < 8) { S.teamErr = 'Enter a passphrase of at least 8 characters, then press Reset passphrase.'; S.teamMsg = ''; return render(); }
+    return teamCall({ action:'password', id:S.teamId, password });
+  },
   teamarchive: d => { if (S.teamBusy) return; return teamCall({ action:'archive', id:d.id }); },
   teamrestore: d => { if (S.teamBusy) return; return teamCall({ action:'restore', id:d.id }); },
   board: () => { S.menu = false; S.screen = 'board'; },
   stages: () => { S.screen = 'stages'; },
   back: () => { S.screen = (S.screen === 'admin' || S.screen === 'team') ? 'board' : (S.screen === 'timer' || S.screen === 'finish') ? 'stages' : 'board'; },
-  new: () => Object.assign(S, {screen:'new', wo:'', cust:'', machine:null, qty:1, mode:'batch', newNote:''}),
+  new: () => { if (!isOffice()) return; Object.assign(S, {screen:'new', wo:'', cust:'', machine:null, qty:1, mode:'batch', newNote:''}); },
   key: d => { const k = d.k; S.wo = k === 'C' ? '' : k === 'del' ? S.wo.slice(0, -1) : (S.wo.length < WO_MAX ? S.wo + k : S.wo); },
   pickcust: d => { S.cust = d.name; },
   machine: d => { S.machine = d.name; },
@@ -514,6 +630,7 @@ const actions = {
   qtydown: () => { S.qty = Math.max(1, S.qty - 1); if (S.qty === 1) S.mode = 'batch'; },
   mode: d => { S.mode = d.m; },
   create: () => {
+    if (!isOffice()) return;
     if (!(S.wo && S.cust.trim() && S.machine)) return;
     const m = MACHINES.find(x => x.name === S.machine);
     const o = {id:uid('o'), wo:S.wo, customer:S.cust.trim(), machine:S.machine, hasRef:m.hasRef, qty:S.qty, mode:S.qty > 1 ? S.mode : 'batch',
@@ -524,7 +641,55 @@ const actions = {
   },
   open: d => Object.assign(S, {activeId:d.id, screen:'stages', unit:1, noteDraft:''}),
   unit: d => { S.unit = Number(d.n); },
-  stage: d => { S.stage = Number(d.n); S.screen = 'timer'; },
+  stage: d => { S.stage = Number(d.n); S.screen = 'timer'; S.runEdit = null; S.runDelete = null; S.runErr = ''; },
+  stagetoggle: d => {
+    const o = cur(); if (!o) return;
+    const n = Number(d.n);
+    const unit = perUnit(o) ? S.unit : 1;
+    const running = o.active && o.active.stage === n && (!perUnit(o) || o.active.unit === unit);
+    stopActive(o);
+    if (!running) o.active = {stage:n, unit, fitter:S.fitter, start:Date.now()};
+    touch(o);
+  },
+  runadd: () => {
+    if (!isOffice()) return;
+    S.runEdit = 'new'; S.runErr = ''; S.runDelete = null;
+    S.runStart = localInput(Date.now() - 3600000);
+    S.runStop = localInput(Date.now());
+  },
+  runedit: d => {
+    if (!isOffice()) return;
+    const o = cur(); const r = o && o.runs.find(x => x.id === d.id); if (!r) return;
+    S.runEdit = r.id; S.runErr = ''; S.runDelete = null;
+    S.runStart = localInput(r.start); S.runStop = localInput(r.stop);
+  },
+  runcancel: () => { S.runEdit = null; S.runErr = ''; },
+  runsave: () => {
+    if (!isOffice()) return;
+    const o = cur(); if (!o) return;
+    const start = fromLocal(S.runStart), stop = fromLocal(S.runStop);
+    if (!start || !stop || stop <= start) { S.runErr = 'Stop must be after start.'; return; }
+    if (S.runEdit === 'new') {
+      const r = {id:uid('r'), stage:S.stage, unit:perUnit(o) ? S.unit : 1, fitter:S.fitter, start, stop, rate:rateForName(S.fitter)};
+      o.runs.push(r); queue('runs', runRow(r, o));
+    } else {
+      const r = o.runs.find(x => x.id === S.runEdit); if (!r) return;
+      r.start = start; r.stop = stop;
+      queue('runs', runRow(r, o));
+    }
+    S.runEdit = null; S.runErr = '';
+    touch(o);
+  },
+  rundelete: d => {
+    if (!isOffice()) return;
+    const o = cur(); if (!o) return;
+    if (S.runDelete !== d.id) { S.runDelete = d.id; return; }
+    o.runs = o.runs.filter(r => r.id !== d.id);
+    queueDelete('runs', d.id);
+    if (S.runEdit === d.id) S.runEdit = null;
+    S.runDelete = null;
+    touch(o);
+  },
   toggle: () => {
     const o = cur(); if (!o) return;
     const running = o.active && o.active.stage === S.stage && (!perUnit(o) || o.active.unit === S.unit);
@@ -547,7 +712,7 @@ const actions = {
   },
   tofinish: () => { const o = cur(); if (o && o.complete.length === 10) S.screen = 'finish'; },
   finish: () => { const o = cur(); if (!o) return; stopActive(o); o.done = true; o.finishedAt = Date.now(); touch(o); S.screen = 'board'; },
-  report: () => { S.showReport = true; S.sendState = 'idle'; S.sendMsg = ''; },
+  report: () => { if (!isOffice()) return; S.showReport = true; S.sendState = 'idle'; S.sendMsg = ''; },
   closereport: () => { S.showReport = false; },
   send: async () => {
     if (!isOffice()) { S.sendState = 'error'; S.sendMsg = 'Only a supervisor or admin can send the report.'; return render(); }
@@ -593,7 +758,7 @@ function vTop() {
     pill = `<button class="runpill" data-a="open" data-id="${esc(live.id)}" title="Open this works order">
       <span class="dot"></span>
       <span class="rp-txt"><span class="rp-k">Live job</span><span class="rp-l">WO ${esc(live.wo)}${live.machine ? ' · ' + esc(live.machine) : ''}</span><span class="rp-s">${esc(stageLine)}</span></span>
-      <span class="rp-time"><span class="rp-c">${hm(orderMs(live) / 6e4)}</span><span class="rp-k">Total WO time</span></span>
+      <span class="rp-time"><span class="rp-c">${hms(orderMs(live))}</span><span class="rp-k">Total WO time</span></span>
     </button>`;
   } else if (greet && who) {
     const open = inOrder
@@ -606,7 +771,7 @@ function vTop() {
     pill = `<button class="runpill idle" data-a="open" data-id="${esc(o.id)}" title="Open this works order">
       <span class="dot"></span>
       <span class="rp-txt"><span class="rp-k">Start a task</span><span class="rp-l">WO ${esc(o.wo)}${o.machine ? ' · ' + esc(o.machine) : ''}</span><span class="rp-s">No Tasks are running</span></span>
-      <span class="rp-time"><span class="rp-c">${hm(orderMs(o) / 6e4)}</span><span class="rp-k">Total WO time</span></span>
+      <span class="rp-time"><span class="rp-c">${hms(orderMs(o))}</span><span class="rp-k">Total WO time</span></span>
     </button>`;
   } else {
     pill = `<button class="runpill idle" data-a="board" title="Open the works order list">
@@ -681,11 +846,11 @@ function vSignin() {
 
 function vAdmin() {
   if (!isOffice()) return '<div class="pad"><div class="empty">You need supervisor or admin permission to open this page.</div></div>';
-  const tab = (!S.admin && S.adminTab === 'settings') ? 'users' : (S.adminTab || 'users');
+  const tab = (!S.admin && S.adminTab === 'settings') ? 'orders' : (S.adminTab || 'orders');
   const tabs = `<div class="admin-tabs" role="tablist">
+      <button class="atab later ${tab === 'orders' ? 'on' : ''}" data-a="admintab" data-tab="orders" role="tab" aria-selected="${tab === 'orders'}">WO live view</button>
       <button class="atab users ${tab === 'users' ? 'on' : ''}" data-a="admintab" data-tab="users" role="tab" aria-selected="${tab === 'users'}">Users</button>
       ${S.admin ? `<button class="atab settings ${tab === 'settings' ? 'on' : ''}" data-a="admintab" data-tab="settings" role="tab" aria-selected="${tab === 'settings'}">Settings</button>` : ''}
-      <button class="atab later ${tab === 'orders' ? 'on' : ''}" data-a="admintab" data-tab="orders" role="tab" aria-selected="${tab === 'orders'}">Works orders</button>
     </div>`;
   if (tab === 'settings') return vAdminSettings(tabs);
   if (tab === 'orders') return vAdminOrders(tabs);
@@ -710,6 +875,9 @@ function vAdmin() {
         <input class="field" id="f-teamname" data-f="teamName" value="${esc(S.teamName)}" placeholder="Full name" autocomplete="off">
         <input class="field" id="f-teamemail" data-f="teamEmail" value="${esc(S.teamEmail)}" placeholder="Email" autocomplete="off" ${editing ? 'disabled' : ''}>
         <input class="field" id="f-teampass" data-f="teamPass" type="password" value="${esc(S.teamPass)}" placeholder="${editing ? 'New passphrase (optional)' : 'Passphrase (min 8 characters)'}" autocomplete="new-password">
+        ${S.admin
+          ? `<input class="field" id="f-teamrate" data-f="teamRate" value="${esc(S.teamRate)}" placeholder="Hourly rate £ (optional)" inputmode="decimal" autocomplete="off">`
+          : `<div class="meta" style="align-self:center">Hourly rate ${S.teamRate === '' ? 'not set' : esc(gbp(Number(S.teamRate) || 0))}. Only an admin can change it.</div>`}
       </div>
       ${roleBtns}
       <div class="btns" style="margin-top:14px">
@@ -721,7 +889,7 @@ function vAdmin() {
     ${S.teamErr ? `<div class="unlock-err" style="margin:0 0 14px">${esc(S.teamErr)}</div>` : ''}
     ${S.teamMsg ? `<div class="meta" style="margin:0 0 14px;color:var(--green)">${esc(S.teamMsg)}</div>` : ''}
     ${rows.length ? `<div class="atbl">
-      <div class="atbl-h"><span>Name</span><span>Email</span><span>Status</span><span>Role</span><span>Actions</span></div>
+      <div class="atbl-h"><span>Name</span><span>Email</span><span>Status</span><span>Role</span><span>Rate</span><span>Actions</span></div>
       ${rows.map(f => {
         const self = f.id === S.userId;
         const locked = !S.admin && (f.admin || f.supervisor) && !self;
@@ -730,6 +898,7 @@ function vAdmin() {
           <span>${esc(f.email)}</span>
           <span>${f.active ? 'Active' : 'Archived'}</span>
           <span>${personRole(f)}</span>
+          <span>${f.hourly_rate == null || f.hourly_rate === '' ? '—' : gbp(Number(f.hourly_rate))}</span>
           <span class="atbl-a">
             <button class="pill pill-o atbl-b" data-a="teamedit" data-id="${esc(f.id)}" ${locked ? 'disabled' : ''}>Edit</button>
             ${f.active
@@ -806,7 +975,7 @@ function woLoggedMs(r) {
   const local = S.orders.find(o => o.id === r.id);
   if (local) return orderMs(local);
   let t = Number(r.logged_ms) || 0;
-  if (r.active) { const s = woActiveStart(r.active); if (s) t += Date.now() - s; }
+  if (r.active) { const s = woActiveStart(r.active); if (s) t += spanCount(s, Date.now()).counted; }
   return t;
 }
 function woStages(r) {
@@ -893,7 +1062,7 @@ function vAdminOrders(tabs) {
       ${rows.map(r => {
         const local = S.orders.find(o => o.id === r.id);
         const running = !!(local && local.active) || !!r.active;
-        const st = r.archived ? 'Archived' : running ? 'Timer running' : r.done ? 'Finished' : 'In progress';
+        const st = r.archived ? 'Archived' : running ? 'Timer running' : r.done ? 'Finished' : 'Paused';
         const on = !!S.woSel[r.id];
         const confirm = S.woConfirm === r.id;
         const done = woStages(r);
@@ -921,17 +1090,60 @@ function vAdminOrders(tabs) {
   </div></div>`;
 }
 
+function orderActivity(o) {
+  let t = o.createdAt || 0;
+  if (o.finishedAt) t = Math.max(t, o.finishedAt);
+  (o.runs || []).forEach(r => { if (r.start) t = Math.max(t, r.start); if (r.stop) t = Math.max(t, r.stop); });
+  (o.notes || []).forEach(n => { if (n.at) t = Math.max(t, n.at); });
+  if (o.active) t = Math.max(t, woActiveStart(o.active) || t);
+  return t;
+}
+function cmpWo(a, b) {
+  return String(a.wo || '').localeCompare(String(b.wo || ''), 'en', {numeric:true, sensitivity:'base'});
+}
+function cmpBoard(a, b) {
+  const live = o => o.active ? 0 : 1;
+  if (live(a) !== live(b)) return live(a) - live(b);
+  if (S.boardSort === 'wo') return cmpWo(a, b);
+  if (S.boardSort === 'customer') return String(a.customer || '').localeCompare(String(b.customer || ''), 'en', {sensitivity:'base'}) || cmpWo(a, b);
+  if (S.boardSort === 'machine') return String(a.machine || '').localeCompare(String(b.machine || ''), 'en', {sensitivity:'base'}) || cmpWo(a, b);
+  return orderActivity(b) - orderActivity(a) || (b.createdAt || 0) - (a.createdAt || 0);
+}
 function vBoard() {
-  const rank = o => o.active ? 0 : o.done ? 2 : 1;
-  const list = S.orders.filter(o => !o.archived).slice().sort((a, b) => rank(a) - rank(b) || b.createdAt - a.createdAt);
+  const shop = S.orders.filter(o => !o.archived);
+  const list = shop.filter(o => {
+    if (S.boardFilter === 'running') return !!o.active;
+    if (S.boardFilter === 'paused') return !o.done && !o.active;
+    if (S.boardFilter === 'finished') return !!o.done;
+    return true;
+  }).sort(cmpBoard);
   const today = new Date().toLocaleDateString('en-GB', {weekday:'long', day:'numeric', month:'long'});
+  const opt = (value, label, current) => `<option value="${value}" ${current === value ? 'selected' : ''}>${label}</option>`;
   return `<div class="scroll" data-scroll="board"><div class="pad">
     <div class="board-head">
       <div><div class="today">Today · ${today}</div><h2 class="h2">Works orders</h2></div>
-      <div class="btns"><button class="pill pill-o" data-a="report">End of day report</button><button class="pill pill-y" data-a="new">+ New works order</button></div>
+      ${isOffice() ? `<div class="btns"><button class="pill pill-o" data-a="report">End of day report</button><button class="pill pill-y" data-a="new">+ New works order</button></div>` : ''}
+    </div>
+    <div class="board-tools">
+      <label class="board-tool">Filter
+        <select id="f-boardfilter" data-f="boardFilter">
+          ${opt('all', 'All', S.boardFilter)}
+          ${opt('running', 'Running', S.boardFilter)}
+          ${opt('paused', 'Paused', S.boardFilter)}
+          ${opt('finished', 'Finished', S.boardFilter)}
+        </select>
+      </label>
+      <label class="board-tool">Sort by
+        <select id="f-boardsort" data-f="boardSort">
+          ${opt('activity', 'Recent activity', S.boardSort)}
+          ${opt('wo', 'Works order', S.boardSort)}
+          ${opt('customer', 'Customer', S.boardSort)}
+          ${opt('machine', 'Machine', S.boardSort)}
+        </select>
+      </label>
     </div>
     ${list.length ? `<div class="cards">${list.map(o => {
-      const st = o.done ? ['Finished','st-done'] : o.active ? ['Running','st-run'] : ['In progress','st-prog'];
+      const st = o.done ? ['Finished','st-done'] : o.active ? ['Running','st-run'] : ['Paused','st-prog'];
       const line = [o.customer, o.machine, 'Qty ' + o.qty + (o.qty > 1 ? ' · ' + (o.mode === 'batch' ? 'batch timer' : 'per unit') : '')].join('  ·  ');
       const nn = o.notes.length;
       return `<button class="card" data-a="open" data-id="${o.id}">
@@ -939,7 +1151,7 @@ function vBoard() {
         <div class="meta">${esc(line)}</div><div class="bar"><i style="width:${o.complete.length * 10}%"></i></div></div>
         <div class="card-r"><div class="big-t">${hm(orderMs(o) / 6e4)}</div><div class="small">${o.complete.length} of 10 stages</div>${nn ? `<div class="tiny">${nn} note${nn > 1 ? 's' : ''}</div>` : ''}</div>
       </button>`;
-    }).join('')}</div>` : `<div class="empty">Nothing open. Start a works order to begin timing.</div>`}
+    }).join('')}</div>` : `<div class="empty">${shop.length ? 'No works orders match this filter.' : 'Nothing open. Start a works order to begin timing.'}</div>`}
   </div></div>`;
 }
 
@@ -981,25 +1193,35 @@ function vStages(o) {
   const hint = o.done ? 'Finished ' + hhmm(o.finishedAt) + ' · included in tonight\u2019s report'
     : remaining ? remaining + ' stage' + (remaining > 1 ? 's' : '') + ' still to complete. Stages can be done in any order.' : 'All 10 stages complete.';
   const notes = o.notes.slice().reverse();
+  const orderTally = tallyRanges(collectRanges(o, null, null, false));
+  const orderBreak = breakText(orderTally);
+  const orderCost = costText(orderTally);
   return `<div class="ohead">
       <div><div class="lbl">${esc([o.customer, o.machine, 'Qty ' + o.qty].join('  ·  '))}</div><div class="otitle">WO ${esc(o.wo)}</div></div>
       <div style="display:flex;align-items:center;gap:16px">
         ${pu ? `<div class="units"><span class="lbl">Unit</span>${Array.from({length:o.qty}, (_, i) => i + 1).map(n => `<button class="unit ${S.unit === n ? 'on' : ''}" data-a="unit" data-n="${n}">${n}</button>`).join('')}</div>` : ''}
-        <div style="text-align:right"><div class="big-t" style="font-size:20px">${hm(orderMs(o) / 6e4)}</div><div class="small">Logged</div></div>
+        <div style="text-align:right"><div class="big-t" style="font-size:20px">${hm(orderTally.counted / 6e4)}</div><div class="small">Counted</div>${orderBreak ? `<div class="brk">${esc(orderBreak)}</div>` : ''}${orderCost ? `<div class="cost">${esc(orderCost)}</div>` : ''}</div>
       </div>
     </div>
     <div class="scroll" data-scroll="stages"><div class="pad" style="padding-top:16px">
       <div class="stagelist">${STAGES.map(s => {
         const done = o.complete.includes(s.n);
         const run = o.active && o.active.stage === s.n && (!pu || o.active.unit === S.unit);
-        const t = loggedMs(o, s.n, uf);
-        const chip = run ? ['Running','run'] : done ? ['Complete','done'] : t > 0 ? ['In progress','prog'] : ['Not started',''];
-        return `<button class="srow ${run ? 'run' : ''} ${done ? 'done' : ''}" style="border-left-color:${s.colour}" data-a="stage" data-n="${s.n}">
-          <span class="snum">${s.n}</span>
-          <span style="min-width:0"><span class="sfn" style="color:${s.colour}">${s.fn}</span><span class="sname">${esc(s.name)}</span></span>
-          <span class="stime"><b>${t > 0 ? hm(t / 6e4) : '—'}</b><small>${o.hasRef ? 'ref ' + hm(s.ref) : 'no ref'}</small></span>
-          <span class="schip ${chip[1]}">${chip[0]}</span>
-        </button>`;
+        const tally = tallyRanges(collectRanges(o, s.n, uf, false));
+        const t = tally.counted;
+        const brk = breakText(tally);
+        const cost = costText(tally);
+        const chip = run ? ['Running','run'] : done ? ['Complete','done'] : t > 0 ? ['Paused','prog'] : ['Not started',''];
+        const liveCounted = run ? spanCount(woActiveStart(o.active), Date.now()).counted : 0;
+        return `<div class="srow ${run ? 'run' : ''} ${done ? 'done' : ''}" style="border-left-color:${s.colour}">
+          <button class="sopen" data-a="stage" data-n="${s.n}">
+            <span class="snum">${s.n}</span>
+            <span style="min-width:0"><span class="sfn" style="color:${s.colour}">${s.fn}</span><span class="sname">${esc(s.name)}</span></span>
+            <span class="stime"><b>${t > 0 ? hm(t / 6e4) : '—'}</b><small>${o.hasRef ? 'ref ' + hm(s.ref) : 'no ref'}</small>${brk ? `<small class="brk">${esc(brk)}</small>` : ''}${cost ? `<small class="cost">${esc(cost)}</small>` : ''}</span>
+            <span class="schip ${chip[1]}">${chip[0]}</span>
+          </button>
+          <button class="sgo ${run ? 'on' : ''}" data-a="stagetoggle" data-n="${s.n}">${run ? 'Stop<small>' + clock(liveCounted) + '</small>' : 'Start'}</button>
+        </div>`;
       }).join('')}</div>
       <div class="notes">
         <div class="notes-h"><b>Works order notes</b><span>${o.notes.length ? o.notes.length + (o.notes.length > 1 ? ' notes' : ' note') : 'None yet'}</span></div>
@@ -1015,28 +1237,65 @@ function vTimer(o) {
   const s = stageOf(S.stage); const pu = perUnit(o); const uf = pu ? S.unit : null;
   const run = o.active && o.active.stage === s.n && (!pu || o.active.unit === S.unit);
   const done = o.complete.includes(s.n);
-  const t = loggedMs(o, s.n, uf);
+  const tally = tallyRanges(collectRanges(o, s.n, uf, false));
+  const t = tally.counted;
   const liveStart = run ? woActiveStart(o.active) : 0;
+  const liveSpan = run ? spanCount(liveStart, Date.now()) : null;
   const runs = o.runs.filter(r => r.stage === s.n && (!pu || r.unit === S.unit));
-  const ref = o.hasRef ? 'Reference ' + hm(s.ref) + '  ·  logged so far ' + hm(t / 6e4) : 'No reference time for this model  ·  logged so far ' + hm(t / 6e4);
-  const overtime = shopClosed() ? ' Overtime after 5pm still logs until you press Stop.' : '';
+  const ref = o.hasRef ? 'Reference ' + hm(s.ref) + '  ·  counted so far ' + hm(t / 6e4) : 'No reference time for this model  ·  counted so far ' + hm(t / 6e4);
+  const overtime = shopClosed() ? ' Overtime after 4:30pm still logs until you press Stop.' : '';
+  const brk = breakText(tally);
+  const cost = costText(tally);
+  const editing = isOffice() && S.runEdit && (S.runEdit === 'new' || runs.some(r => r.id === S.runEdit));
+  const runCost = r => {
+    if (!isOffice()) return '';
+    const p = spanCount(r.start, r.stop);
+    if (p.counted <= 0) return '';
+    if (r.rate == null) return 'No rate';
+    return gbp((p.counted / 36e5) * Number(r.rate));
+  };
   return `<div class="timer">
     <div class="tmain">
       <div class="tfn" style="color:${s.colour}"><i style="background:${s.colour}"></i>Stage ${s.n} · ${s.fn}</div>
       <h2 class="tname">${esc(s.name)}</h2>
       <div class="tsub">${esc('WO ' + o.wo + '  ·  ' + o.machine + (pu ? '  ·  Unit ' + S.unit + ' of ' + o.qty : ''))}</div>
       <div class="panel ${run ? 'run' : ''}">
-        <div class="pl"><div class="lbl">${run ? 'Running now' : t > 0 ? 'Logged on this stage' : 'Not started'}</div>
-        <div class="clock">${run ? clock(Date.now() - liveStart) : clock(t)}</div><div class="ref">${ref}${overtime}</div></div>
-        <button class="ss" data-a="toggle">${run ? 'Stop' : 'Start'}</button>
+        <div class="pl"><div class="lbl">${run ? 'Running now' : t > 0 ? 'Counted on this stage' : 'Not started'}</div>
+        <div class="clock">${run ? clock(Date.now() - liveStart) : clock(t)}</div>
+        <div class="ref">${ref}${overtime}</div>
+        ${run ? `<div class="counted">Counted ${hm(liveSpan.counted / 6e4)} on this run</div>` : ''}
+        ${brk ? `<div class="brk">${esc(brk)}</div>` : ''}
+        ${cost ? `<div class="cost">${esc(cost)}</div>` : ''}
+        </div>
       </div>
       <button class="complete ${done ? 're' : ''}" data-a="complete">${done ? 'Reopen stage' : 'Mark stage complete'}</button>
     </div>
     <div class="tside">
+      <button class="ss ${run ? 'on' : ''}" data-a="toggle">${run ? 'Stop' : 'Start'}</button>
       <div class="tasks"><div class="lbl">Key tasks</div>${s.tasks.map(x => `<div class="task">${esc(x)}</div>`).join('')}</div>
       <div class="runs"><div class="runs-h"><span class="lbl">Runs</span><span>${runs.length + (run ? 1 : 0)} run${runs.length + (run ? 1 : 0) === 1 ? '' : 's'}</span></div>
-        ${runs.map(r => `<div class="run"><span><b>${hhmm(r.start)} → ${hhmm(r.stop)}</b><small>${esc(r.fitter)}</small></span><strong>${hm((r.stop - r.start) / 6e4)}</strong></div>`).join('')}
-        ${run ? `<div class="run live"><span><b>${hhmm(liveStart)} → running</b><small>${esc(o.active.fitter)}</small></span><strong>${hm((Date.now() - liveStart) / 6e4)}</strong></div>` : ''}
+        ${isOffice() ? `<div class="run-tools"><button class="pill pill-o atbl-b" data-a="runadd">Add time</button></div>` : ''}
+        ${editing ? `<div class="run-form">
+          <div class="lbl">${S.runEdit === 'new' ? 'Add time' : 'Edit time'}</div>
+          <label class="tiny" for="f-runstart">Start</label>
+          <input class="field" id="f-runstart" data-f="runStart" type="datetime-local" value="${esc(S.runStart)}">
+          <label class="tiny" for="f-runstop">Stop</label>
+          <input class="field" id="f-runstop" data-f="runStop" type="datetime-local" value="${esc(S.runStop)}">
+          ${S.runErr ? `<div class="unlock-err">${esc(S.runErr)}</div>` : ''}
+          <div class="btns" style="margin-top:10px">
+            <button class="pill pill-y atbl-b" data-a="runsave">Save</button>
+            <button class="pill pill-o atbl-b" data-a="runcancel">Cancel</button>
+          </div>
+        </div>` : ''}
+        ${runs.map(r => {
+          const p = spanCount(r.start, r.stop);
+          const line = breakText(p);
+          const pounds = runCost(r);
+          return `<div class="run"><span><b>${hhmm(r.start)} → ${hhmm(r.stop)}</b><small>${esc(r.fitter)}</small>${line ? `<small class="brk">${esc(line)}</small>` : ''}${pounds ? `<small class="cost">${esc(pounds)}</small>` : ''}</span><strong>${hm(p.counted / 6e4)}</strong>
+            ${isOffice() ? `<span class="run-a"><button class="pill pill-o atbl-b" data-a="runedit" data-id="${esc(r.id)}">Edit</button><button class="pill pill-o atbl-b" data-a="rundelete" data-id="${esc(r.id)}">${S.runDelete === r.id ? 'Confirm delete' : 'Delete'}</button></span>` : ''}
+          </div>`;
+        }).join('')}
+        ${run ? `<div class="run live"><span><b>${hhmm(liveStart)} → running</b><small>${esc(o.active.fitter)}</small>${breakText(liveSpan) ? `<small class="brk">${esc(breakText(liveSpan))}</small>` : ''}</span><strong>${hm(liveSpan.counted / 6e4)}</strong></div>` : ''}
         ${!runs.length && !run ? '<div class="muted">No time logged on this stage yet.</div>' : ''}
       </div>
     </div>
@@ -1044,16 +1303,25 @@ function vTimer(o) {
 }
 
 function vFinish(o) {
-  const total = orderMs(o) / 6e4;
+  const orderTally = tallyRanges(collectRanges(o, null, null, false));
+  const total = orderTally.counted / 6e4;
   const budget = o.hasRef ? FIXED_BUDGET_100T : null;
   const refTotal = o.hasRef ? STAGES.reduce((a, s) => a + s.ref, 0) : null;
   const line = budget == null ? 'No reference times exist for this model yet — this build becomes the first recorded set.'
     : (total >= budget ? '+' : '−') + hm(Math.abs(total - budget)) + ' against the fixed budget of ' + hm(budget) + '.';
+  const brk = breakText(orderTally);
+  const cost = costText(orderTally);
   return `<div class="pad" style="padding-bottom:12px;flex:none"><h2 class="h2" style="font-size:26px">Finish job · WO ${esc(o.wo)}</h2><div class="meta" style="margin-top:6px">${esc([o.customer, o.machine, 'Qty ' + o.qty].join('  ·  '))}</div></div>
     <div class="scroll" data-scroll="finish"><div style="padding:0 26px 20px">
-      <div class="tbl h"><span>#</span><span>Process stage</span><span class="r">Reference</span><span class="r">Logged</span></div>
-      ${STAGES.map(s => `<div class="tbl"><span class="n">${s.n}</span><span>${esc(s.name)}</span><span class="r" style="color:var(--g3)">${o.hasRef ? hm(s.ref) : '—'}</span><span class="r" style="font-weight:700">${hm(loggedMs(o, s.n, null) / 6e4)}</span></div>`).join('')}
+      <div class="tbl h"><span>#</span><span>Process stage</span><span class="r">Reference</span><span class="r">Counted</span></div>
+      ${STAGES.map(s => {
+        const tally = tallyRanges(collectRanges(o, s.n, null, false));
+        const ded = breakText(tally);
+        return `<div class="tbl"><span class="n">${s.n}</span><span>${esc(s.name)}${ded ? `<small class="brk" style="display:block;margin-top:4px">${esc(ded)}</small>` : ''}</span><span class="r" style="color:var(--g3)">${o.hasRef ? hm(s.ref) : '—'}</span><span class="r" style="font-weight:700">${hm(tally.counted / 6e4)}</span></div>`;
+      }).join('')}
       <div class="tbl t"><span></span><span style="font:900 12px/1 var(--font);letter-spacing:.08em;text-transform:uppercase">Works order total</span><span class="r" style="color:var(--g3)">${refTotal == null ? '—' : hm(refTotal)}</span><span class="r" style="font-weight:900;font-size:16px">${hm(total)}</span></div>
+      ${brk ? `<div class="brk" style="margin-top:10px">${esc(brk)}</div>` : ''}
+      ${cost ? `<div class="cost" style="margin-top:6px">${esc(cost)}</div>` : ''}
       <div class="var">${line}</div>
       ${o.notes.length ? `<div class="nbox"><b>Notes</b>${o.notes.map(n => `<div>${esc(n.text)} <span>— ${esc(n.fitter)}</span></div>`).join('')}</div>` : ''}
     </div></div>
@@ -1069,14 +1337,24 @@ function vReport() {
       <div class="meta">Sent automatically each weekday evening as an Excel file to ${esc(CFG.reportEmail || 'the Production Manager')}. This is today\u2019s preview.</div></div>
     <div class="sheet-b">
       ${touched.length ? touched.map(o => {
-        const rows = STAGES.filter(s => todayMs(o, s.n) > 0);
-        const tot = todayMs(o, null) / 6e4;
+        const rows = STAGES.filter(s => tallyRanges(collectRanges(o, s.n, null, true)).elapsed > 0);
+        const dayTally = tallyRanges(collectRanges(o, null, null, true));
+        const tot = dayTally.counted / 6e4;
+        const brk = breakText(dayTally);
+        const cost = costText(dayTally);
         return `<div style="display:flex;gap:10px;align-items:baseline;margin-bottom:9px"><b style="font:900 15px/1 var(--font)">WO ${esc(o.wo)}</b><span class="meta" style="font-size:12px">${esc([o.customer, o.machine, 'Qty ' + o.qty].join(' · '))}</span></div>
           ${o.notes.length ? `<div class="nbox" style="margin:0 0 9px;padding:9px 12px;font-size:12px">Notes: ${esc(o.notes.map(n => n.text).join('  ·  '))}</div>` : ''}
-          <div class="rtbl">${rows.map(s => { const m = todayMs(o, s.n) / 6e4; return `<div class="rrow"><span style="color:var(--g3)">${s.n}</span><span style="color:var(--ink)">${esc(s.name)}</span><span class="r">${hm(m)}</span><span class="r" style="color:var(--g3)">${(m / 60).toFixed(2)}</span></div>`; }).join('')}
-          <div class="rrow t"><span></span><span>Today total</span><span class="r">${hm(tot)}</span><span class="r" style="color:var(--g4)">${(tot / 60).toFixed(2)}</span></div></div>`;
+          <div class="rtbl">${rows.map(s => {
+            const st = tallyRanges(collectRanges(o, s.n, null, true));
+            const m = st.counted / 6e4;
+            const ded = breakText(st);
+            return `<div class="rrow"><span style="color:var(--g3)">${s.n}</span><span style="color:var(--ink)">${esc(s.name)}${ded ? `<small class="brk" style="display:block">${esc(ded)}</small>` : ''}</span><span class="r">${hm(m)}</span><span class="r" style="color:var(--g3)">${(m / 60).toFixed(2)}</span></div>`;
+          }).join('')}
+          <div class="rrow t"><span></span><span>Today counted</span><span class="r">${hm(tot)}</span><span class="r" style="color:var(--g4)">${(tot / 60).toFixed(2)}</span></div></div>
+          ${brk ? `<div class="brk" style="margin:-8px 0 14px">${esc(brk)}</div>` : ''}
+          ${cost ? `<div class="cost" style="margin:-4px 0 14px">${esc(cost)}</div>` : ''}`;
       }).join('') : '<div class="empty">No time logged today yet.</div>'}
-      <div class="tiny" style="line-height:1.5">The spreadsheet also shows totals to date per stage, every start and stop, and hours by function and fitter.</div>
+      <div class="tiny" style="line-height:1.5">Times are counted after weekday breaks. The spreadsheet also shows the break taken off, the rate, the cost, totals to date per stage, every start and stop, and hours by function and fitter.</div>
     </div>
     <div class="sheet-f"><button class="pill pill-o" data-a="closereport">Close</button>
       <span class="msg ${S.sendState === 'error' ? 'err' : ''}" style="flex:1;text-align:right;white-space:pre-wrap">${esc(S.sendMsg)}</span>
@@ -1093,11 +1371,11 @@ function view() {
   let body = '';
   if (S.screen === 'board') body = vBoard();
   if (S.screen === 'admin') body = isOffice() ? vAdmin() : (S.screen = 'board', vBoard());
-  if (S.screen === 'new') body = vNew();
+  if (S.screen === 'new') body = isOffice() ? vNew() : (S.screen = 'board', vBoard());
   if (S.screen === 'stages') body = vStages(o);
   if (S.screen === 'timer') body = vTimer(o);
   if (S.screen === 'finish') body = vFinish(o);
-  return `<div class="app">${vTop()}${S.screen !== 'board' ? vCrumbs() : ''}<main class="main">${body}</main>${S.showReport ? vReport() : ''}</div>`;
+  return `<div class="app">${vTop()}${S.screen !== 'board' ? vCrumbs() : ''}<main class="main">${body}</main>${S.showReport && isOffice() ? vReport() : ''}</div>`;
 }
 
 // ---------- render (keeps typing focus and scroll position) ----------
@@ -1128,9 +1406,14 @@ root.addEventListener('click', e => {
   render();
 });
 root.addEventListener('input', e => {
-  const f = e.target.dataset.f; if (!f) return;
+  const f = e.target.dataset.f; if (!f || e.target.tagName === 'SELECT') return;
   S[f] = e.target.value;
-  if (f === 'pass' || f === 'teamPass' || f === 'intSecret' || f === 'intTestTo') { S.unlockError = ''; return; }
+  if (f === 'pass' || f === 'teamPass' || f === 'intSecret' || f === 'intTestTo' || f === 'teamRate' || f === 'runStart' || f === 'runStop') { S.unlockError = ''; return; }
+  render();
+});
+root.addEventListener('change', e => {
+  const f = e.target.dataset.f; if (!f || e.target.tagName !== 'SELECT') return;
+  S[f] = e.target.value;
   render();
 });
 root.addEventListener('submit', e => { e.preventDefault(); if (S.screen === 'unlock') actions.unlock(); });
@@ -1147,7 +1430,8 @@ setInterval(() => {
   greetShown = g;
   const liveShop = S.orders.some(o => o.active);
   const liveAdmin = S.screen === 'admin' && S.adminTab === 'orders' && ((S.woList || []).some(r => r.active) || S.orders.some(o => o.active));
-  if (liveShop || liveAdmin || greetChanged) render();
+  const choosing = document.activeElement && document.activeElement.tagName === 'SELECT';
+  if ((liveShop || liveAdmin || greetChanged) && !S.runEdit && !choosing) render();
 }, 1000);
 setInterval(() => { if (S.unlocked || S.handover) flush().then(pull); }, 60000);
 setInterval(checkIdle, 30000);

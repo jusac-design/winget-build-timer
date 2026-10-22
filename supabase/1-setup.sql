@@ -95,7 +95,7 @@ begin
     new.email
   )
   on conflict (id) do update set
-    full_name = excluded.full_name,
+    full_name = coalesce(nullif(new.raw_user_meta_data->>'full_name',''), nullif(new.raw_user_meta_data->>'name',''), public.fitters.full_name),
     email = excluded.email;
   return new;
 end;
