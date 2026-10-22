@@ -76,9 +76,9 @@ begin
 end;
 $$;
 
-revoke all on function public.active_started_at(jsonb) from public;
-revoke all on function public.uk_close_at(timestamptz) from public;
-revoke all on function public.close_open_timers() from public;
+revoke all on function public.active_started_at(jsonb) from public, anon, authenticated;
+revoke all on function public.uk_close_at(timestamptz) from public, anon, authenticated;
+revoke all on function public.close_open_timers() from public, anon, authenticated;
 grant execute on function public.close_open_timers() to postgres;
 
 select cron.unschedule('build-mate-close-timers')

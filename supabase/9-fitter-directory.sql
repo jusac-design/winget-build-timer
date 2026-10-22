@@ -7,8 +7,8 @@ select id, full_name
 from public.fitters
 where active = true;
 
+revoke all on public.fitter_directory from public, anon, authenticated;
 grant select on public.fitter_directory to anon, authenticated;
-revoke all on public.fitter_directory from public;
 
 create or replace function public.fitter_email_for_login(p_id uuid)
 returns text

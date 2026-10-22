@@ -27,7 +27,30 @@ const STAGES = [
   { n: 9, fn: "QC", name: "Paint", ref: 240 },
   { n: 10, fn: "QC", name: "Finish", ref: 35 },
 ];
-const FIXED_BUDGET_100T = 765;
+type StageInfo = { n: number; fn: string; name: string; ref: number | null; retired?: boolean };
+function stagesForOrder(machine: string, runStages: number[], catalog: StageInfo[], links: { machine: string; stage: number; position: number; ref_minutes: number | null; retired?: boolean }[]): StageInfo[] {
+  if (!catalog.length) {
+    const useRef = machine === "100T ES Diesel";
+    return STAGES.map((s) => ({ n: s.n, fn: s.fn, name: s.name, ref: useRef ? s.ref : null }));
+  }
+  const byN = new Map(catalog.map((s) => [s.n, s]));
+  const list: StageInfo[] = [];
+  const have = new Set<number>();
+  links.filter((r) => r.machine === machine).sort((a, b) => a.position - b.position).forEach((row) => {
+    const s = byN.get(row.stage);
+    if (!s || s.retired) return;
+    have.add(s.n);
+    list.push({ n: s.n, fn: s.fn, name: s.name, ref: row.ref_minutes == null ? null : Number(row.ref_minutes) });
+  });
+  runStages.forEach((n) => {
+    if (have.has(n)) return;
+    const s = byN.get(n) || STAGES.find((x) => x.n === n);
+    if (!s) return;
+    have.add(n);
+    list.push({ n: s.n, fn: s.fn, name: s.name, ref: null });
+  });
+  return list;
+}
 const TZ = "Europe/London";
 
 const cors = {
@@ -261,14 +284,20 @@ Deno.serve(async (req) => {
     }
 
     const runIds = allRuns.map((r) => r.id).filter((id) => id && id !== "live");
-    const [rateRows, fitterRateRows, fitterRows] = await Promise.all([
+    const [rateRows, fitterRateRows, fitterRows, stageRows, machineRows] = await Promise.all([
       runIds.length ? db.from("run_rates").select("run_id, hourly_rate").in("run_id", runIds) : Promise.resolve({ data: [] as { run_id: string; hourly_rate: number | null }[], error: null }),
       db.from("fitter_rates").select("fitter_id, hourly_rate"),
       db.from("fitters").select("id, full_name"),
+      db.from("stages").select("n, fn, name, retired").order("n"),
+      db.from("machine_stages").select("machine, stage, position, ref_minutes"),
     ]);
     if (rateRows.error) throw new Error(rateRows.error.message);
     if (fitterRateRows.error) throw new Error(fitterRateRows.error.message);
     if (fitterRows.error) throw new Error(fitterRows.error.message);
+    if (stageRows.error) throw new Error(stageRows.error.message);
+    if (machineRows.error) throw new Error(machineRows.error.message);
+    const catalog: StageInfo[] = (stageRows.data || []).map((s) => ({ n: s.n, fn: s.fn, name: s.name, ref: null, retired: !!s.retired }));
+    const links = machineRows.data || [];
     const rateByRun = new Map((rateRows.data || []).map((row) => [row.run_id, row.hourly_rate == null ? null : Number(row.hourly_rate)]));
     const rateByFitter = new Map((fitterRateRows.data || []).map((row) => [row.fitter_id, row.hourly_rate == null ? null : Number(row.hourly_rate)]));
     const rateByName = new Map<string, number | null>();
@@ -292,9 +321,10 @@ Deno.serve(async (req) => {
       t1.push(["Works order", o.wo, "Customer", o.customer, "Machine", o.machine, "Qty", o.qty, "Status", status]);
       if (oNotes.length) t1.push(["Notes", oNotes.map((n: any) => `${n.text} (${n.fitter})`).join("  |  ")]);
       t1.push(["#", "Function", "Process stage", "Today counted (Hr:Min)", "Today counted (hours)", "To date counted (Hr:Min)", "To date counted (hours)", "Break deducted", "Reference (Hr:Min)", "Cost"]);
+      const list = stagesForOrder(o.machine, [...new Set(oRuns.map((r: { stage: number }) => Number(r.stage)))], catalog, (links || []) as { machine: string; stage: number; position: number; ref_minutes: number | null }[]);
       let tToday = 0, tAll = 0, costAll = 0, costKnown = false, costMissing = false;
       const breakAcc: Record<string, { name: string; ms: number }> = {};
-      for (const s of STAGES) {
+      for (const s of list) {
         const stageRuns = oRuns.filter((r) => r.stage === s.n);
         const sr = stageRuns.map(priced);
         const all = sr.reduce((a, r) => a + r.span.counted / 60000, 0);
@@ -313,12 +343,13 @@ Deno.serve(async (req) => {
         if (stageMissing) costMissing = true;
         tToday += day; tAll += all;
         const stageCostCell = stageKnown ? (stageMissing ? money(stageCost) + " + no rate" : money(stageCost)) : (stageMissing ? "No rate" : "");
-        t1.push([s.n, s.fn, s.name, hm(day), dec(day), hm(all), dec(all), breakLabel(Object.values(stageBreaks)), o.has_ref ? hm(s.ref) : "—", stageCostCell]);
+        t1.push([s.n, s.fn, s.name, hm(day), dec(day), hm(all), dec(all), breakLabel(Object.values(stageBreaks)), s.ref == null ? "—" : hm(s.ref), stageCostCell]);
       }
       const ded = breakLabel(Object.values(breakAcc));
       const costCell = costKnown ? (costMissing ? money(costAll) + " + no rate" : money(costAll)) : (costMissing ? "No rate" : "");
-      t1.push(["", "", "Works order total", hm(tToday), dec(tToday), hm(tAll), dec(tAll), ded, o.has_ref ? hm(STAGES.reduce((a, s) => a + s.ref, 0)) : "—", costCell]);
-      if (o.has_ref) t1.push(["", "", "Fixed budget", "", "", hm(FIXED_BUDGET_100T), dec(FIXED_BUDGET_100T)]);
+      const knownRefs = list.filter((s) => s.ref != null);
+      const refTotal = knownRefs.length ? knownRefs.reduce((a, s) => a + Number(s.ref), 0) : null;
+      t1.push(["", "", "Works order total", hm(tToday), dec(tToday), hm(tAll), dec(tAll), ded, refTotal == null ? "—" : hm(refTotal), costCell]);
       emailRows.push(`<tr><td style="padding:6px 10px;border-bottom:1px solid #e9eded"><b>WO ${o.wo}</b></td><td style="padding:6px 10px;border-bottom:1px solid #e9eded">${o.customer ?? ""}</td><td style="padding:6px 10px;border-bottom:1px solid #e9eded">${o.machine ?? ""}</td><td style="padding:6px 10px;border-bottom:1px solid #e9eded;text-align:right">${hm(tToday)}</td><td style="padding:6px 10px;border-bottom:1px solid #e9eded;text-align:right">${hm(tAll)}</td><td style="padding:6px 10px;border-bottom:1px solid #e9eded;text-align:right">${costCell || "—"}</td><td style="padding:6px 10px;border-bottom:1px solid #e9eded">${status}</td></tr>`);
     }
     if (!(orders.data ?? []).length) t1.push([], ["No work was logged today."]);
@@ -327,7 +358,7 @@ Deno.serve(async (req) => {
     const t2: unknown[][] = [["Works order", "Customer", "Machine", "Unit", "Stage #", "Process stage", "Function", "Fitter", "Start", "Stop", "Gross (Hr:Min)", "Break deducted", "Counted (Hr:Min)", "Counted (hours)", "Rate", "Cost", "Flag"]];
     const fitterMins: Record<string, number> = {}, fitterCost: Record<string, number> = {}, fitterMissing: Record<string, boolean> = {}, fnMins: Record<string, number> = {};
     for (const r of allRuns.filter((r) => selectedReport || dayKey(r.started_at) === today)) {
-      const o: any = byId.get(r.order_id); const s = STAGES.find((x) => x.n === r.stage);
+      const o: any = byId.get(r.order_id); const s = catalog.find((x) => x.n === r.stage) || STAGES.find((x) => x.n === r.stage);
       if (!s) continue;
       const p = priced(r);
       const countedMin = p.span.counted / 60000;
@@ -342,7 +373,9 @@ Deno.serve(async (req) => {
     const t3: unknown[][] = [["Hours by fitter", "Counted (Hr:Min)", "Counted (hours)", "Cost"]];
     Object.entries(fitterMins).sort().forEach(([k, v]) => t3.push([k, hm(v), dec(v), fitterCost[k] != null ? (fitterMissing[k] ? money(fitterCost[k]) + " + no rate" : money(fitterCost[k])) : (fitterMissing[k] ? "No rate" : "")]));
     t3.push([], ["Hours by function", "Counted (Hr:Min)", "Counted (hours)"]);
-    ["Fabrication", "Stores", "Assembly", "Build", "QC"].forEach((f) => t3.push([f, hm(fnMins[f] ?? 0), dec(fnMins[f] ?? 0)]));
+    const fnOrder = ["Fabrication", "Stores", "Assembly", "Build", "QC"];
+    catalog.forEach((s) => { if (fnOrder.indexOf(s.fn) < 0) fnOrder.push(s.fn); });
+    fnOrder.forEach((f) => t3.push([f, hm(fnMins[f] ?? 0), dec(fnMins[f] ?? 0)]));
 
     const XLSX = xlsx();
     const wb = XLSX.utils.book_new();

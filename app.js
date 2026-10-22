@@ -17,18 +17,26 @@ const STAGES = [
   {n:10, fn:'QC', colour:'#e11f1c', name:'Finish', ref:35, tasks:['Pull Cord Plate','Engine Stop Switch','Engine Lids* (UK)','Engine Grills* (UK)','Decals','Battery']}
 ];
 const MACHINES = [
-  {name:'100T ES Diesel', hasRef:true},
-  {name:'150T ES Diesel', hasRef:false},
-  {name:'150TFT ES Diesel', hasRef:false},
-  {name:'175T ES Diesel', hasRef:false},
-  {name:'175TFT ES Diesel', hasRef:false}
+  {name:'100T ES Diesel'},
+  {name:'150T ES Diesel'},
+  {name:'150TFT ES Diesel'},
+  {name:'175T ES Diesel'},
+  {name:'175TFT ES Diesel'}
 ];
-const FIXED_BUDGET_100T = 765; // 12h 45m
 const QUICK_PICKS = 5;
 const WO_MAX = 10;
 const KEY = 'build-mate-live-v1';
 const ACT_KEY = 'build-mate-live-activity';
 const FITTERS_KEY = 'build-mate-fitters';
+const PROCESS_KEY = 'build-mate-process';
+const FNS = [
+  {fn:'Fabrication', colour:'#00a3e0'},
+  {fn:'Stores', colour:'#8c4799'},
+  {fn:'Assembly', colour:'#e57200'},
+  {fn:'Build', colour:'#009639'},
+  {fn:'QC', colour:'#e11f1c'}
+];
+const FN_SWATCHES = ['#00a3e0', '#8c4799', '#e57200', '#009639', '#e11f1c', '#f5b800', '#373a36', '#046a82'];
 const IDLE_MS = 8 * 60 * 60 * 1000; // auto-lock after 8 hours with no taps
 
 // ---------- helpers ----------
@@ -133,7 +141,6 @@ function applyCloseOfDay() {
   });
   return n;
 }
-const stageOf = n => STAGES.find(s => s.n === n);
 const HOME_ICON = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M10 21v-6h4v6"/></svg>';
 const BACK_ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>';
 
@@ -145,6 +152,10 @@ const S = {
   adminTab:'orders', intList:[], intForm:false, intId:null, intFrom:'', intTo:'', intSecret:'', intTestTo:'',
   woList:[], woFilter:'shop', woQ:'', woSel:{}, woConfirm:null, woSend:'idle',
   boardFilter:'all', boardSort:'activity',
+  stages:[], machineStages:[], machines:[], functions:[], processReady:false, procMachine:MACHINES[0].name, procBusy:false, procErr:'', procMsg:'',
+  machineForm:false, machineEdit:null, machineName:'', machineConfirm:null,
+  stageForm:false, stageEdit:null, stageName:'', stageFn:'Assembly', stageTasks:'',
+  fnForm:false, fnEdit:null, fnName:'', fnPick:'#00a3e0', fnConfirm:null,
   orders:[], activeId:null, stage:1, unit:1,
   wo:'', cust:'', machine:null, qty:1, mode:'batch', newNote:'', noteDraft:'',
   pass:'', unlockError:'', unlockBusy:false,
@@ -156,9 +167,88 @@ let outbox = [];
   try {
     S.fitters = (JSON.parse(localStorage.getItem(FITTERS_KEY) || '[]') || []).map(f => ({id:f.id, full_name:f.full_name}));
   } catch (e) { S.fitters = []; }
+  try {
+    const p = JSON.parse(localStorage.getItem(PROCESS_KEY) || '{}');
+    if (p.stages && p.stages.length) { S.stages = p.stages; S.machineStages = p.machineStages || []; S.machines = p.machines || []; S.functions = p.functions || []; S.processReady = true; }
+  } catch (e) {}
 })();
 const save = () => { try { localStorage.setItem(KEY, JSON.stringify({orders:S.orders, outbox})); } catch (e) {} };
 const cur = () => S.orders.find(o => o.id === S.activeId) || null;
+
+function functionList() {
+  if (S.functions && S.functions.length) return S.functions.slice().sort((a, b) => (a.position || 0) - (b.position || 0) || String(a.name).localeCompare(String(b.name)));
+  return FNS.map((f, i) => ({name:f.fn, colour:f.colour, position:i + 1}));
+}
+function fnColour(fn) {
+  const list = functionList();
+  return (list.find(f => f.name === fn) || list[0] || {colour:'#373a36'}).colour;
+}
+function defaultFn() {
+  const list = functionList();
+  return list.some(f => f.name === 'Assembly') ? 'Assembly' : (list[0] ? list[0].name : '');
+}
+function asStage(row) {
+  let tasks = row.tasks || [];
+  if (typeof tasks === 'string') { try { tasks = JSON.parse(tasks); } catch (e) { tasks = []; } }
+  return {n:Number(row.n), fn:row.fn, colour:row.colour || fnColour(row.fn), name:row.name, tasks:Array.isArray(tasks) ? tasks : [], retired:!!row.retired};
+}
+function catalog() {
+  return (S.processReady && S.stages.length) ? S.stages : STAGES.map(s => Object.assign({}, s, {retired:false}));
+}
+function stageOf(n) { return catalog().find(s => s.n === Number(n)) || null; }
+function processStages(machine) {
+  if (!S.processReady) {
+    const useRef = machine === '100T ES Diesel';
+    return STAGES.map(s => Object.assign({}, s, {retired:false, ref: useRef ? s.ref : null, extra:false}));
+  }
+  return S.machineStages.filter(r => r.machine === machine).slice().sort((a, b) => a.position - b.position).map(r => {
+    const s = stageOf(r.stage);
+    if (!s || s.retired) return null;
+    return Object.assign({}, s, {ref: r.ref_minutes == null || r.ref_minutes === '' ? null : Number(r.ref_minutes), extra:false});
+  }).filter(Boolean);
+}
+function orderStages(o) {
+  const proc = processStages(o && o.machine);
+  const have = {};
+  proc.forEach(s => { have[s.n] = true; });
+  const used = {};
+  if (o) {
+    (o.runs || []).forEach(r => { used[r.stage] = true; });
+    (o.complete || []).forEach(n => { used[n] = true; });
+    if (o.active) used[o.active.stage] = true;
+  }
+  const extra = Object.keys(used).map(Number).filter(n => !have[n]).map(n => {
+    const s = stageOf(n);
+    return s ? Object.assign({}, s, {ref:null, extra:true}) : null;
+  }).filter(Boolean).sort((a, b) => a.n - b.n);
+  return proc.concat(extra);
+}
+function stageProgress(o) {
+  const proc = processStages(o && o.machine);
+  const complete = (o && o.complete) || [];
+  const done = proc.filter(s => complete.includes(s.n)).length;
+  const total = proc.length;
+  return {done, total, pct: total ? Math.round(done * 100 / total) : 0};
+}
+function machineList() {
+  if (S.machines && S.machines.length) return S.machines.slice().sort((a, b) => (a.position || 0) - (b.position || 0) || String(a.name).localeCompare(String(b.name)));
+  return MACHINES.map((m, i) => ({name:m.name, position:i + 1}));
+}
+function refText(mins) { return mins == null ? 'no ref' : 'ref ' + hm(mins); }
+async function loadProcess() {
+  if (!sb || (!S.unlocked && !S.handover)) return;
+  const st = await sb.from('stages').select('n,fn,colour,name,tasks,retired').order('n');
+  const ms = await sb.from('machine_stages').select('machine,stage,position,ref_minutes');
+  const mac = await sb.from('machines').select('name,position').order('position');
+  const fn = await sb.from('stage_functions').select('name,colour,position').order('position');
+  if (st.error || ms.error || mac.error || fn.error) { console.warn(st.error || ms.error || mac.error || fn.error); return; }
+  S.stages = (st.data || []).map(asStage);
+  S.machineStages = ms.data || [];
+  S.machines = mac.data || [];
+  S.functions = fn.data || [];
+  S.processReady = S.stages.length > 0;
+  try { localStorage.setItem(PROCESS_KEY, JSON.stringify({stages:S.stages, machineStages:S.machineStages, machines:S.machines, functions:S.functions})); } catch (e) {}
+}
 
 // ---------- sync with Supabase ----------
 const orderRow = o => ({id:o.id, wo:o.wo, customer:o.customer, machine:o.machine, has_ref:o.hasRef, qty:o.qty, mode:o.mode,
@@ -351,6 +441,7 @@ async function pull() {
     runs: runs.filter(r => r.order_id === x.id).map(r => ({id:r.id, stage:r.stage, unit:r.unit, fitter:r.fitter, start:ms(r.started_at), stop:ms(r.stopped_at), rate:Object.prototype.hasOwnProperty.call(rateMap, r.id) ? rateMap[r.id] : null})),
     notes: notes.filter(n => n.order_id === x.id).map(n => ({id:n.id, text:n.text, fitter:n.fitter, at:ms(n.created_at)})).sort((a, b) => a.at - b.at)
   })).sort((a, b) => a.createdAt - b.createdAt);
+  await loadProcess();
   applyCloseOfDay();
   save(); S.sync = 'saved'; render();
 }
@@ -439,6 +530,17 @@ function quickPicks() {
   return Object.values(t).sort((a, b) => b.n - a.n || b.last - a.last).slice(0, QUICK_PICKS).map(x => x.name);
 }
 
+async function writeProcess(run) {
+  if (!S.admin || !sb) { S.procErr = 'Sign in as an admin to change the process.'; return render(); }
+  if (S.procBusy) return;
+  S.procBusy = true; S.procErr = ''; S.procMsg = '';
+  render();
+  try { await run(); await loadProcess(); }
+  catch (e) { S.procErr = (e && e.message) || 'Could not save that change.'; }
+  S.procBusy = false;
+  render();
+}
+
 const actions = {
   pick: d => {
     const f = S.fitters.find(x => x.id === d.id);
@@ -448,6 +550,7 @@ const actions = {
       S.handover = false; S.unlocked = true; S.screen = 'board'; S.fitter = f.full_name || S.fitter;
       touchActivity();
       flush().then(pull);
+      loadProcess();
       return;
     }
     if (S.userId && f.id !== S.userId && sb) {
@@ -491,6 +594,7 @@ const actions = {
     S.screen = 'board';
     touchActivity();
     render();
+    loadProcess().then(() => { if (S.unlocked) render(); });
     flush().then(pull);
   },
   home: () => lockShop(),
@@ -505,9 +609,11 @@ const actions = {
   admintab: d => {
     if (!isOffice()) return;
     let tab = d.tab || 'orders';
-    if (tab === 'settings' && !S.admin) tab = 'orders';
+    if ((tab === 'settings' || tab === 'stages' || tab === 'machines' || tab === 'functions') && !S.admin) tab = 'orders';
     S.adminTab = tab; S.teamForm = false; S.intForm = false; S.teamErr = ''; S.teamMsg = ''; S.woConfirm = null; S.woSend = 'idle';
+    S.stageForm = false; S.fnForm = false; S.fnConfirm = null; S.procErr = ''; S.procMsg = '';
     if (S.adminTab === 'settings') return teamCall({ action: 'integrations_list' });
+    if (S.adminTab === 'stages' || S.adminTab === 'machines' || S.adminTab === 'functions') return loadProcess().then(render);
     if (S.adminTab === 'users') return teamCall({ action: 'list' });
     if (S.adminTab === 'orders') return teamCall({ action: 'orders_list' });
   },
@@ -521,6 +627,248 @@ const actions = {
   intsave: () => {
     if (!S.admin || S.teamBusy || !S.intId) return;
     return teamCall({ action:'integrations_save', id:S.intId, secret:S.intSecret, config:{ from:S.intFrom, to:S.intTo } });
+  },
+  fnnew: () => {
+    if (!S.admin) return;
+    Object.assign(S, {fnForm:true, fnEdit:null, fnName:'', fnPick:'#00a3e0', fnConfirm:null, procErr:'', procMsg:''});
+  },
+  fnedit: d => {
+    if (!S.admin) return;
+    const f = functionList().find(x => x.name === d.name); if (!f) return;
+    Object.assign(S, {fnForm:true, fnEdit:f.name, fnName:f.name, fnPick:f.colour, fnConfirm:null, procErr:'', procMsg:''});
+  },
+  fncancel: () => { S.fnForm = false; S.fnEdit = null; S.fnName = ''; S.fnConfirm = null; },
+  fnpick: d => {
+    const colour = String(d.colour || '').trim().toLowerCase();
+    if (/^#[0-9a-f]{6}$/.test(colour)) S.fnPick = colour;
+  },
+  fnsave: () => {
+    if (!S.admin) return;
+    const name = String(S.fnName || '').trim();
+    const colour = String(S.fnPick || '').trim().toLowerCase();
+    if (!name) { S.procErr = 'Enter a function name.'; S.procMsg = ''; return render(); }
+    if (!/^#[0-9a-f]{6}$/.test(colour)) { S.procErr = 'Pick a colour for this function.'; S.procMsg = ''; return render(); }
+    if (functionList().some(f => f.name.toLowerCase() === name.toLowerCase() && f.name !== S.fnEdit)) {
+      S.procErr = 'A function with that name already exists.'; S.procMsg = ''; return render();
+    }
+    const from = S.fnEdit;
+    return writeProcess(async () => {
+      const saved = await sb.rpc('save_stage_function', {p_from:from, p_name:name, p_colour:colour});
+      if (saved.error) throw saved.error;
+      if (S.stageFn === from) S.stageFn = name;
+      S.fnForm = false; S.fnEdit = null; S.fnName = ''; S.fnConfirm = null;
+      S.procMsg = from ? 'Function saved. Stages that use it now show this name and colour.' : 'Function added. Choose it when you add or edit a stage.';
+    });
+  },
+  fndelete: d => {
+    if (!S.admin) return;
+    const name = d.name;
+    if (!functionList().some(f => f.name === name)) return;
+    if (S.fnConfirm !== name) { S.fnConfirm = name; S.procErr = ''; S.procMsg = ''; return; }
+    return writeProcess(async () => {
+      S.fnConfirm = null;
+      const del = await sb.rpc('delete_stage_function', {p_name:name});
+      if (del.error) throw del.error;
+      if (S.fnEdit === name) { S.fnForm = false; S.fnEdit = null; }
+      S.procMsg = 'Function deleted.';
+    });
+  },
+  fnmove: d => {
+    if (!S.admin) return;
+    const dir = Number(d.dir);
+    const name = d.name;
+    return writeProcess(async () => {
+      const rows = functionList();
+      const i = rows.findIndex(r => r.name === name);
+      const j = i + dir;
+      if (i < 0 || j < 0 || j >= rows.length) return;
+      const next = rows.slice();
+      const moved = next.splice(i, 1)[0];
+      next.splice(j, 0, moved);
+      for (let k = 0; k < next.length; k++) {
+        if (Number(next[k].position) === k + 1) continue;
+        const upd = await sb.from('stage_functions').update({position:k + 1, updated_at:new Date().toISOString()}).eq('name', next[k].name);
+        if (upd.error) throw upd.error;
+      }
+    });
+  },
+  stagenew: () => {
+    if (!S.admin) return;
+    Object.assign(S, {stageForm:true, stageEdit:null, stageName:'', stageFn:defaultFn(), stageTasks:'', procErr:'', procMsg:''});
+  },
+  stageedit: d => {
+    if (!S.admin) return;
+    const s = stageOf(d.n); if (!s) return;
+    Object.assign(S, {stageForm:true, stageEdit:s.n, stageName:s.name, stageFn:s.fn, stageTasks:(s.tasks || []).join('\n'), procErr:'', procMsg:''});
+  },
+  stagecancel: () => { S.stageForm = false; S.stageEdit = null; },
+  stagefn: d => { if (functionList().some(f => f.name === d.fn)) S.stageFn = d.fn; },
+  stagesave: () => {
+    if (!S.admin) return;
+    const name = String(S.stageName || '').trim();
+    if (!name) { S.procErr = 'Enter a stage name.'; S.procMsg = ''; return render(); }
+    const fn = functionList().some(f => f.name === S.stageFn) ? S.stageFn : defaultFn();
+    if (!fn) { S.procErr = 'Add a function before adding a stage.'; S.procMsg = ''; return render(); }
+    const tasks = String(S.stageTasks || '').split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+    const row = {fn, colour:fnColour(fn), name, tasks, updated_at:new Date().toISOString()};
+    return writeProcess(async () => {
+      if (S.stageEdit) {
+        const upd = await sb.from('stages').update(row).eq('n', S.stageEdit);
+        if (upd.error) throw upd.error;
+        S.procMsg = 'Stage saved.';
+      } else {
+        const n = catalog().reduce((m, s) => Math.max(m, Number(s.n) || 0), 0) + 1;
+        const ins = await sb.from('stages').insert(Object.assign({n, retired:false}, row));
+        if (ins.error) throw ins.error;
+        S.procMsg = 'Stage added. Tick it on each machine that should use it.';
+      }
+      S.stageForm = false; S.stageEdit = null;
+    });
+  },
+  stageretire: d => {
+    if (!S.admin) return;
+    const n = Number(d.n);
+    return writeProcess(async () => {
+      const runs = await sb.from('runs').select('id', {count:'exact', head:true}).eq('stage', n);
+      if (runs.error) throw runs.error;
+      const orders = await sb.from('orders').select('id').contains('complete', [n]);
+      if (orders.error) throw orders.error;
+      const live = S.orders.some(o => (o.active && o.active.stage === n) || (o.runs || []).some(r => r.stage === n) || (o.complete || []).includes(n));
+      const used = (runs.count || 0) > 0 || (orders.data || []).length > 0 || live;
+      const gone = await sb.from('machine_stages').delete().eq('stage', n);
+      if (gone.error) throw gone.error;
+      if (used) {
+        const upd = await sb.from('stages').update({retired:true, updated_at:new Date().toISOString()}).eq('n', n);
+        if (upd.error) throw upd.error;
+        S.procMsg = 'Retired. Jobs that already used it still show it. It is off every machine.';
+      } else {
+        const del = await sb.from('stages').delete().eq('n', n);
+        if (del.error) throw del.error;
+        S.procMsg = 'Stage deleted.';
+      }
+    });
+  },
+  stagerestore: d => {
+    if (!S.admin) return;
+    const n = Number(d.n);
+    return writeProcess(async () => {
+      const upd = await sb.from('stages').update({retired:false, updated_at:new Date().toISOString()}).eq('n', n);
+      if (upd.error) throw upd.error;
+      S.procMsg = 'Stage restored. Tick it on a machine to show it on the shop floor.';
+    });
+  },
+  procmachine: d => { if (machineList().some(m => m.name === d.name)) { S.procMachine = d.name; S.procErr = ''; S.procMsg = ''; S.machineConfirm = null; S.machineForm = false; } },
+  machinenew: () => {
+    if (!S.admin) return;
+    Object.assign(S, {machineForm:true, machineEdit:null, machineName:'', machineConfirm:null, procErr:'', procMsg:''});
+  },
+  machineedit: () => {
+    if (!S.admin) return;
+    const name = S.procMachine;
+    if (!machineList().some(m => m.name === name)) return;
+    Object.assign(S, {machineForm:true, machineEdit:name, machineName:name, machineConfirm:null, procErr:'', procMsg:''});
+  },
+  machinecancel: () => { S.machineForm = false; S.machineEdit = null; S.machineName = ''; },
+  machinesave: () => {
+    if (!S.admin) return;
+    const name = String(S.machineName || '').trim();
+    if (!name) { S.procErr = 'Enter a machine name.'; S.procMsg = ''; return render(); }
+    if (machineList().some(m => m.name.toLowerCase() === name.toLowerCase() && m.name !== S.machineEdit)) {
+      S.procErr = 'A machine with that name already exists.'; S.procMsg = ''; return render();
+    }
+    const from = S.machineEdit;
+    return writeProcess(async () => {
+      if (from) {
+        const renamed = await sb.rpc('rename_machine', {p_from:from, p_to:name});
+        if (renamed.error) throw renamed.error;
+        S.orders.forEach(o => { if (o.machine === from) o.machine = name; });
+        (S.woList || []).forEach(r => { if (r.machine === from) r.machine = name; });
+        if (S.procMachine === from) S.procMachine = name;
+        if (S.machine === from) S.machine = name;
+        save();
+        S.procMsg = 'Machine renamed. Existing works orders use the new name.';
+      } else {
+        const pos = machineList().reduce((m, x) => Math.max(m, Number(x.position) || 0), 0) + 1;
+        const ins = await sb.from('machines').insert({name, position:pos});
+        if (ins.error) throw ins.error;
+        S.procMachine = name;
+        S.procMsg = 'Machine added. Tick the stages it uses.';
+      }
+      S.machineForm = false; S.machineEdit = null; S.machineName = '';
+    });
+  },
+  machinedelete: () => {
+    if (!S.admin) return;
+    const name = S.procMachine;
+    if (!name) return;
+    if (S.machineConfirm !== name) { S.machineConfirm = name; S.procErr = ''; S.procMsg = ''; return; }
+    return writeProcess(async () => {
+      const del = await sb.rpc('delete_machine', {p_name:name});
+      if (del.error) throw del.error;
+      S.machineConfirm = null;
+      S.procMachine = '';
+      S.procMsg = 'Machine deleted.';
+    });
+  },
+  proctick: d => {
+    if (!S.admin) return;
+    const n = Number(d.n);
+    const on = S.machineStages.some(r => r.machine === S.procMachine && Number(r.stage) === n);
+    return on ? actions.procremove(d) : actions.procadd(d);
+  },
+  procadd: d => {
+    if (!S.admin) return;
+    const n = Number(d.n);
+    const s = stageOf(n);
+    if (!s || s.retired) return;
+    return writeProcess(async () => {
+      const rows = S.machineStages.filter(r => r.machine === S.procMachine);
+      if (rows.some(r => r.stage === n)) return;
+      const pos = rows.reduce((m, r) => Math.max(m, Number(r.position) || 0), 0) + 1;
+      const ins = await sb.from('machine_stages').insert({machine:S.procMachine, stage:n, position:pos, ref_minutes:null});
+      if (ins.error) throw ins.error;
+      S.procMsg = 'Added to ' + S.procMachine + '.';
+    });
+  },
+  procremove: d => {
+    if (!S.admin) return;
+    const n = Number(d.n);
+    return writeProcess(async () => {
+      const del = await sb.from('machine_stages').delete().eq('machine', S.procMachine).eq('stage', n);
+      if (del.error) throw del.error;
+      S.procMsg = 'Removed from this machine. Jobs that already logged it still show it.';
+    });
+  },
+  procmove: d => {
+    if (!S.admin) return;
+    const dir = Number(d.dir);
+    const n = Number(d.n);
+    return writeProcess(async () => {
+      const rows = S.machineStages.filter(r => r.machine === S.procMachine).slice().sort((a, b) => a.position - b.position);
+      const i = rows.findIndex(r => r.stage === n);
+      const j = i + dir;
+      if (i < 0 || j < 0 || j >= rows.length) return;
+      const a = rows[i], b = rows[j];
+      const u1 = await sb.from('machine_stages').update({position:b.position}).eq('machine', S.procMachine).eq('stage', a.stage);
+      if (u1.error) throw u1.error;
+      const u2 = await sb.from('machine_stages').update({position:a.position}).eq('machine', S.procMachine).eq('stage', b.stage);
+      if (u2.error) throw u2.error;
+    });
+  },
+  procref: d => {
+    if (!S.admin) return;
+    const raw = String(d.value == null ? '' : d.value).trim();
+    let ref = null;
+    if (raw !== '') {
+      if (!/^\d+$/.test(raw)) { S.procErr = 'Reference time is whole minutes, or leave the box blank.'; S.procMsg = ''; return render(); }
+      ref = Number(raw);
+    }
+    const n = Number(d.n);
+    return writeProcess(async () => {
+      const upd = await sb.from('machine_stages').update({ref_minutes:ref}).eq('machine', S.procMachine).eq('stage', n);
+      if (upd.error) throw upd.error;
+      S.procMsg = ref == null ? 'Reference cleared.' : 'Reference saved.';
+    });
   },
   wofilter: d => { S.woFilter = d.f || 'shop'; S.woConfirm = null; },
   wotoggle: d => {
@@ -632,8 +980,8 @@ const actions = {
   create: () => {
     if (!isOffice()) return;
     if (!(S.wo && S.cust.trim() && S.machine)) return;
-    const m = MACHINES.find(x => x.name === S.machine);
-    const o = {id:uid('o'), wo:S.wo, customer:S.cust.trim(), machine:S.machine, hasRef:m.hasRef, qty:S.qty, mode:S.qty > 1 ? S.mode : 'batch',
+    const hasRef = processStages(S.machine).some(s => s.ref != null);
+    const o = {id:uid('o'), wo:S.wo, customer:S.cust.trim(), machine:S.machine, hasRef:hasRef, qty:S.qty, mode:S.qty > 1 ? S.mode : 'batch',
       complete:[], done:false, archived:false, finishedAt:null, active:null, createdAt:Date.now(), runs:[], notes:[]};
     S.orders.push(o); touch(o);
     if (S.newNote.trim()) { const n = {id:uid('n'), text:S.newNote.trim(), fitter:S.fitter, at:Date.now()}; o.notes.push(n); queue('notes', noteRow(n, o)); }
@@ -647,6 +995,8 @@ const actions = {
     const n = Number(d.n);
     const unit = perUnit(o) ? S.unit : 1;
     const running = o.active && o.active.stage === n && (!perUnit(o) || o.active.unit === unit);
+    const listed = orderStages(o).find(s => s.n === n);
+    if (listed && listed.extra && !running) return;
     stopActive(o);
     if (!running) o.active = {stage:n, unit, fitter:S.fitter, start:Date.now()};
     touch(o);
@@ -693,6 +1043,8 @@ const actions = {
   toggle: () => {
     const o = cur(); if (!o) return;
     const running = o.active && o.active.stage === S.stage && (!perUnit(o) || o.active.unit === S.unit);
+    const listed = orderStages(o).find(s => s.n === S.stage);
+    if (listed && listed.extra && !running) return;
     stopActive(o);
     if (!running) o.active = {stage:S.stage, unit:perUnit(o) ? S.unit : 1, fitter:S.fitter, start:Date.now()};
     touch(o);
@@ -710,7 +1062,7 @@ const actions = {
     const n = {id:uid('n'), text:t, fitter:S.fitter, at:Date.now()};
     o.notes.push(n); queue('notes', noteRow(n, o)); touch(o); S.noteDraft = '';
   },
-  tofinish: () => { const o = cur(); if (o && o.complete.length === 10) S.screen = 'finish'; },
+  tofinish: () => { const o = cur(); if (!o) return; const prog = stageProgress(o); if (prog.done === prog.total) S.screen = 'finish'; },
   finish: () => { const o = cur(); if (!o) return; stopActive(o); o.done = true; o.finishedAt = Date.now(); touch(o); S.screen = 'board'; },
   report: () => { if (!isOffice()) return; S.showReport = true; S.sendState = 'idle'; S.sendMsg = ''; },
   closereport: () => { S.showReport = false; },
@@ -805,7 +1157,7 @@ function vCrumbs() {
   if (S.screen === 'new') c.push({l:'New works order'});
   if (S.screen === 'admin') c.push({l:'Admin'});
   if (o && ['stages','timer','finish'].includes(S.screen)) c.push({l:'WO ' + o.wo, a:'stages'});
-  if (S.screen === 'timer') { const s = stageOf(S.stage); c.push({l:'Stage ' + s.n + ' · ' + s.name}); }
+  if (S.screen === 'timer') { const s = stageOf(S.stage); c.push({l: s ? 'Stage ' + s.n + ' · ' + s.name : 'Stage'}); }
   if (S.screen === 'finish') c.push({l:'Finish job'});
   return `<div class="crumbs">
     <button class="back" data-a="back">${BACK_ICON}<span>${back}</span></button>
@@ -846,13 +1198,19 @@ function vSignin() {
 
 function vAdmin() {
   if (!isOffice()) return '<div class="pad"><div class="empty">You need supervisor or admin permission to open this page.</div></div>';
-  const tab = (!S.admin && S.adminTab === 'settings') ? 'orders' : (S.adminTab || 'orders');
+  const tab = (!S.admin && (S.adminTab === 'settings' || S.adminTab === 'stages' || S.adminTab === 'machines' || S.adminTab === 'functions')) ? 'orders' : (S.adminTab || 'orders');
   const tabs = `<div class="admin-tabs" role="tablist">
       <button class="atab later ${tab === 'orders' ? 'on' : ''}" data-a="admintab" data-tab="orders" role="tab" aria-selected="${tab === 'orders'}">WO live view</button>
       <button class="atab users ${tab === 'users' ? 'on' : ''}" data-a="admintab" data-tab="users" role="tab" aria-selected="${tab === 'users'}">Users</button>
-      ${S.admin ? `<button class="atab settings ${tab === 'settings' ? 'on' : ''}" data-a="admintab" data-tab="settings" role="tab" aria-selected="${tab === 'settings'}">Settings</button>` : ''}
+      ${S.admin ? `<button class="atab fns ${tab === 'functions' ? 'on' : ''}" data-a="admintab" data-tab="functions" role="tab" aria-selected="${tab === 'functions'}">Functions</button>
+      <button class="atab stages ${tab === 'stages' ? 'on' : ''}" data-a="admintab" data-tab="stages" role="tab" aria-selected="${tab === 'stages'}">Stages</button>
+      <button class="atab mach ${tab === 'machines' ? 'on' : ''}" data-a="admintab" data-tab="machines" role="tab" aria-selected="${tab === 'machines'}">Machines</button>
+      <button class="atab settings ${tab === 'settings' ? 'on' : ''}" data-a="admintab" data-tab="settings" role="tab" aria-selected="${tab === 'settings'}">Settings</button>` : ''}
     </div>`;
   if (tab === 'settings') return vAdminSettings(tabs);
+  if (tab === 'functions') return vAdminFunctions(tabs);
+  if (tab === 'stages') return vAdminStages(tabs);
+  if (tab === 'machines') return vAdminMachines(tabs);
   if (tab === 'orders') return vAdminOrders(tabs);
   const editing = !!S.teamId;
   const rows = S.teamList.slice().sort((a, b) => Number(b.active) - Number(a.active) || String(a.full_name).localeCompare(String(b.full_name)));
@@ -861,7 +1219,7 @@ function vAdmin() {
       <div class="admin-fields">
         <button class="opt ${S.teamRole === 'user' ? 'on' : ''}" data-a="teamrole" data-role="user" ${roleLocked ? 'disabled' : ''}><span>User</span><small>Shop floor only</small></button>
         <button class="opt ${S.teamRole === 'supervisor' ? 'on' : ''}" data-a="teamrole" data-role="supervisor" ${roleLocked ? 'disabled' : ''}><span>Supervisor</span><small>Live now, users, archive WOs</small></button>
-        <button class="opt ${S.teamRole === 'admin' ? 'on' : ''}" data-a="teamrole" data-role="admin" ${roleLocked ? 'disabled' : ''}><span>Admin</span><small>Settings and roles</small></button>
+        <button class="opt ${S.teamRole === 'admin' ? 'on' : ''}" data-a="teamrole" data-role="admin" ${roleLocked ? 'disabled' : ''}><span>Admin</span><small>Functions, stages, machines, settings</small></button>
       </div>${roleLocked ? '<div class="meta" style="margin-top:8px">You cannot change your own role.</div>' : ''}` : '';
   return `<div class="scroll" data-scroll="admin"><div class="pad">
     ${tabs}
@@ -915,6 +1273,146 @@ function vAdmin() {
         </div>`;
       }).join('')}
     </div>` : `<div class="empty">${S.teamBusy ? 'Loading…' : 'No people yet. Add the first person.'}</div>`}
+  </div></div>`;
+}
+
+function procNote() {
+  return `${S.procErr ? `<div class="unlock-err" style="margin:0 0 14px">${esc(S.procErr)}</div>` : ''}${S.procMsg ? `<div class="meta" style="margin:0 0 14px;color:var(--green)">${esc(S.procMsg)}</div>` : ''}`;
+}
+
+function vAdminFunctions(tabs) {
+  const rows = functionList();
+  const swatches = FN_SWATCHES.slice();
+  if (S.fnPick && swatches.indexOf(S.fnPick) < 0) swatches.push(S.fnPick);
+  return `<div class="scroll" data-scroll="admin"><div class="pad">
+    ${tabs}
+    <div class="board-head">
+      <div><h2 class="h2">Functions</h2><div class="meta" style="margin-top:8px">Functions group the stages and set their colour. Renaming or recolouring updates every stage that uses that function. A function that is still on a stage cannot be deleted.</div></div>
+      <button class="pill pill-y" data-a="fnnew" ${S.procBusy ? 'disabled' : ''}>+ Add function</button>
+    </div>
+    ${S.fnForm ? `<div class="admin-form">
+      <div class="lbl">${S.fnEdit ? 'Edit function' : 'New function'}</div>
+      <input class="field" id="f-fnname" data-f="fnName" value="${esc(S.fnName)}" placeholder="Function name" autocomplete="off">
+      <div class="lbl" style="margin-top:14px">Colour</div>
+      <div class="fn-colours">
+        ${swatches.map(c => `<button type="button" class="fn-swatch ${S.fnPick === c ? 'on' : ''}" data-a="fnpick" data-colour="${c}" style="background:${c}" aria-label="${c}" ${S.procBusy ? 'disabled' : ''}></button>`).join('')}
+        <input class="fn-colour-input" id="f-fncolour" data-f="fnPick" type="color" value="${esc(S.fnPick)}" aria-label="Custom colour" ${S.procBusy ? 'disabled' : ''}>
+      </div>
+      <div class="btns" style="margin-top:14px">
+        <button class="pill pill-y" data-a="fnsave" ${S.procBusy ? 'disabled' : ''}>${S.fnEdit ? 'Save function' : 'Add function'}</button>
+        <button class="pill pill-o" data-a="fncancel">Cancel</button>
+      </div>
+    </div>` : ''}
+    ${procNote()}
+    ${rows.length ? `<div class="atbl fns">
+      <div class="atbl-h"><span></span><span>Function</span><span>Stages</span><span>Actions</span></div>
+      ${rows.map((f, i) => {
+        const used = catalog().filter(s => s.fn === f.name).length;
+        return `<div class="atbl-r">
+          <span><span class="fn-dot" style="background:${esc(f.colour)}"></span></span>
+          <span style="color:${esc(f.colour)}"><b>${esc(f.name)}</b></span>
+          <span>${used}</span>
+          <span class="atbl-a">
+            <button class="pill pill-o atbl-b" data-a="fnedit" data-name="${esc(f.name)}" ${S.procBusy ? 'disabled' : ''}>Edit</button>
+            <button class="pill pill-o atbl-b" data-a="fnmove" data-name="${esc(f.name)}" data-dir="-1" ${i === 0 || S.procBusy ? 'disabled' : ''}>Up</button>
+            <button class="pill pill-o atbl-b" data-a="fnmove" data-name="${esc(f.name)}" data-dir="1" ${i === rows.length - 1 || S.procBusy ? 'disabled' : ''}>Down</button>
+            <button class="pill pill-o atbl-b" data-a="fndelete" data-name="${esc(f.name)}" ${S.procBusy ? 'disabled' : ''}>${S.fnConfirm === f.name ? 'Confirm delete' : 'Delete'}</button>
+          </span>
+        </div>`;
+      }).join('')}
+    </div>` : '<div class="empty">No functions yet. Add the first one.</div>'}
+  </div></div>`;
+}
+
+function vAdminStages(tabs) {
+  const rows = catalog().slice().sort((a, b) => a.n - b.n);
+  return `<div class="scroll" data-scroll="admin"><div class="pad">
+    ${tabs}
+    <div class="board-head">
+      <div><h2 class="h2">Stages</h2><div class="meta" style="margin-top:8px">The master list. A stage appears on the shop floor only after you add it to a machine. Its colour comes from the function you choose.</div></div>
+      <button class="pill pill-y" data-a="stagenew" ${S.procBusy ? 'disabled' : ''}>+ Add stage</button>
+    </div>
+    ${S.stageForm ? `<div class="admin-form">
+      <div class="lbl">${S.stageEdit ? 'Edit stage ' + S.stageEdit : 'New stage'}</div>
+      <div class="admin-fields">
+        <input class="field" id="f-stagename" data-f="stageName" value="${esc(S.stageName)}" placeholder="Stage name" autocomplete="off">
+        <textarea class="field" id="f-stagetasks" data-f="stageTasks" placeholder="Key tasks, one per line" rows="4">${esc(S.stageTasks)}</textarea>
+      </div>
+      <div class="lbl" style="margin-top:14px">Function</div>
+      <div class="chips">${functionList().map(f => `<button class="chip ${S.stageFn === f.name ? 'on' : ''}" data-a="stagefn" data-fn="${esc(f.name)}" style="border-color:${f.colour}"><span style="color:${f.colour}">${esc(f.name)}</span></button>`).join('') || '<span class="meta">Add a function first.</span>'}</div>
+      <div class="btns" style="margin-top:14px">
+        <button class="pill pill-y" data-a="stagesave" ${S.procBusy ? 'disabled' : ''}>${S.stageEdit ? 'Save stage' : 'Add stage'}</button>
+        <button class="pill pill-o" data-a="stagecancel">Cancel</button>
+      </div>
+    </div>` : ''}
+    ${procNote()}
+    ${rows.length ? `<div class="atbl stages">
+      <div class="atbl-h"><span>#</span><span>Stage</span><span>Function</span><span>Tasks</span><span>Status</span><span>Actions</span></div>
+      ${rows.map(s => `<div class="atbl-r ${s.retired ? 'off' : ''}">
+        <span>${s.n}</span>
+        <span><b>${esc(s.name)}</b></span>
+        <span style="color:${s.colour}">${esc(s.fn)}</span>
+        <span>${(s.tasks || []).length ? esc(s.tasks.join(' · ')) : '—'}</span>
+        <span>${s.retired ? 'Retired' : 'Active'}</span>
+        <span class="atbl-a">
+          <button class="pill pill-o atbl-b" data-a="stageedit" data-n="${s.n}" ${S.procBusy ? 'disabled' : ''}>Edit</button>
+          ${s.retired
+            ? `<button class="pill pill-o atbl-b" data-a="stagerestore" data-n="${s.n}" ${S.procBusy ? 'disabled' : ''}>Restore</button>`
+            : `<button class="pill pill-o atbl-b" data-a="stageretire" data-n="${s.n}" ${S.procBusy ? 'disabled' : ''}>Delete</button>`}
+        </span>
+      </div>`).join('')}
+    </div>` : '<div class="empty">No stages yet.</div>'}
+  </div></div>`;
+}
+
+function vAdminMachines(tabs) {
+  const list = machineList();
+  const machine = list.some(m => m.name === S.procMachine) ? S.procMachine : (list[0] ? list[0].name : '');
+  if (machine && machine !== S.procMachine) S.procMachine = machine;
+  const on = machine ? processStages(machine) : [];
+  const onIds = {};
+  on.forEach(s => { onIds[s.n] = true; });
+  const off = catalog().filter(s => !s.retired && !onIds[s.n]).sort((a, b) => a.n - b.n);
+  return `<div class="scroll" data-scroll="admin"><div class="pad">
+    ${tabs}
+    <div class="board-head">
+      <div><h2 class="h2">Machines</h2><div class="meta" style="margin-top:8px">Add a machine, rename it, or delete it when no works order uses it. Tick the stages it uses. Ticked stages run in the order shown. Blank reference means no reference.</div></div>
+      <button class="pill pill-y" data-a="machinenew" ${S.procBusy ? 'disabled' : ''}>+ Add machine</button>
+    </div>
+    ${S.machineForm ? `<div class="admin-form">
+      <div class="lbl">${S.machineEdit ? 'Rename machine' : 'New machine'}</div>
+      <input class="field" id="f-machinename" data-f="machineName" value="${esc(S.machineName)}" placeholder="Machine name" autocomplete="off">
+      <div class="btns" style="margin-top:14px">
+        <button class="pill pill-y" data-a="machinesave" ${S.procBusy ? 'disabled' : ''}>${S.machineEdit ? 'Save name' : 'Add machine'}</button>
+        <button class="pill pill-o" data-a="machinecancel">Cancel</button>
+      </div>
+    </div>` : ''}
+    ${procNote()}
+    <div class="chips" style="margin-bottom:12px">${list.map(m => `<button class="chip ${machine === m.name ? 'on' : ''}" data-a="procmachine" data-name="${esc(m.name)}">${esc(m.name)}</button>`).join('')}</div>
+    ${machine ? `<div class="btns" style="margin-bottom:16px">
+      <button class="pill pill-o" data-a="machineedit" ${S.procBusy ? 'disabled' : ''}>Edit name</button>
+      <button class="pill pill-o" data-a="machinedelete" ${S.procBusy ? 'disabled' : ''}>${S.machineConfirm === machine ? 'Confirm delete' : 'Delete machine'}</button>
+    </div>
+    <div class="lbl">Stages for ${esc(machine)}</div>
+    ${(() => {
+      const rows = on.map(s => Object.assign({on:true}, s)).concat(off.map(s => Object.assign({on:false, ref:null}, s)));
+      if (!rows.length) return '<div class="empty">No stages yet. Add them on the Stages tab.</div>';
+      return rows.map(s => {
+        const at = s.on ? on.findIndex(x => x.n === s.n) : -1;
+        return `<div class="proc-row ${s.on ? '' : 'proc-off'}">
+          <label class="tick"><input type="checkbox" data-a="proctick" data-n="${s.n}" ${s.on ? 'checked' : ''} ${S.procBusy ? 'disabled' : ''} aria-label="${s.on ? 'Included' : 'Not included'}"></label>
+          <span class="snum">${s.n}</span>
+          <span><span class="sfn" style="color:${s.colour}">${esc(s.fn)}</span><span class="sname">${esc(s.name)}</span></span>
+          ${s.on ? `<label class="proc-ref">Reference min
+            <input class="field" id="f-ref-${s.n}" data-ref="${s.n}" inputmode="numeric" value="${s.ref == null ? '' : s.ref}" placeholder="No ref" autocomplete="off" ${S.procBusy ? 'disabled' : ''}>
+          </label>
+          <span class="atbl-a">
+            <button class="pill pill-o atbl-b" data-a="procmove" data-n="${s.n}" data-dir="-1" ${at === 0 || S.procBusy ? 'disabled' : ''}>Up</button>
+            <button class="pill pill-o atbl-b" data-a="procmove" data-n="${s.n}" data-dir="1" ${at === on.length - 1 || S.procBusy ? 'disabled' : ''}>Down</button>
+          </span>` : '<span></span><span></span>'}
+        </div>`;
+      }).join('');
+    })()}` : '<div class="empty">No machines yet. Add the first one.</div>'}
   </div></div>`;
 }
 
@@ -978,11 +1476,6 @@ function woLoggedMs(r) {
   if (r.active) { const s = woActiveStart(r.active); if (s) t += spanCount(s, Date.now()).counted; }
   return t;
 }
-function woStages(r) {
-  const local = S.orders.find(o => o.id === r.id);
-  const c = (local && local.complete) || r.complete || [];
-  return Array.isArray(c) ? c.length : 0;
-}
 function woLiveJobs() {
   const seen = {};
   const out = [];
@@ -1016,16 +1509,15 @@ function vLiveNow() {
       <div class="lbl">Live now</div>
       ${live.length ? `<div class="live-cards">${live.map(r => {
         const stg = stageOf(r.active.stage);
-        const done = woStages(r);
-        const pct = Math.round(done * 10);
+        const prog = stageProgress(r);
         return `<button type="button" class="live-card" data-a="open" data-id="${esc(r.id)}">
           <div class="live-top"><span class="wo">WO ${esc(r.wo)}</span><span class="status st-run">Running</span></div>
           <div class="meta">${esc(r.customer || '—')} · ${esc(r.machine || '—')}</div>
           <div class="live-who">On now: ${esc(r.active.fitter || '—')} · Stage ${r.active.stage}${stg ? ' · ' + esc(stg.name) : ''}</div>
           <div class="live-time-lbl">Total WO time</div>
           <div class="live-time">${hm(woLoggedMs(r) / 6e4)}</div>
-          <div class="small">${pct}% complete · ${done} of 10 stages</div>
-          <div class="bar"><i style="width:${pct}%"></i></div>
+          <div class="small">${prog.pct}% complete · ${prog.done} of ${prog.total} stages</div>
+          <div class="bar"><i style="width:${prog.pct}%"></i></div>
         </button>`;
       }).join('')}</div>` : `<div class="live-empty">No timers running.</div>`}
     </div>`;
@@ -1065,7 +1557,7 @@ function vAdminOrders(tabs) {
         const st = r.archived ? 'Archived' : running ? 'Timer running' : r.done ? 'Finished' : 'Paused';
         const on = !!S.woSel[r.id];
         const confirm = S.woConfirm === r.id;
-        const done = woStages(r);
+        const prog = stageProgress(Object.assign({}, r, { machine: (local && local.machine) || r.machine, complete: (local && local.complete) || r.complete || [] }));
         return `<div class="atbl-r ${r.archived ? 'off' : ''}">
           <span><button class="opt ${on ? 'on' : ''}" data-a="wotoggle" data-id="${esc(r.id)}" ${S.teamBusy ? 'disabled' : ''}><span>${on ? 'Selected' : 'Select'}</span></button></span>
           <span><b>WO ${esc(r.wo)}</b></span>
@@ -1073,7 +1565,7 @@ function vAdminOrders(tabs) {
           <span>${esc(r.machine || '—')}</span>
           <span>${r.qty || 1}</span>
           <span>${hm(woLoggedMs(r) / 6e4)}</span>
-          <span>${done} of 10 · ${done * 10}%</span>
+          <span>${prog.done} of ${prog.total} · ${prog.pct}%</span>
           <span>${st}</span>
           <span class="atbl-a">
             ${confirm && S.admin ? `<span class="meta" style="flex:1 1 100%">Delete WO ${esc(r.wo)}? This cannot be undone.</span>
@@ -1146,10 +1638,11 @@ function vBoard() {
       const st = o.done ? ['Finished','st-done'] : o.active ? ['Running','st-run'] : ['Paused','st-prog'];
       const line = [o.customer, o.machine, 'Qty ' + o.qty + (o.qty > 1 ? ' · ' + (o.mode === 'batch' ? 'batch timer' : 'per unit') : '')].join('  ·  ');
       const nn = o.notes.length;
+      const prog = stageProgress(o);
       return `<button class="card" data-a="open" data-id="${o.id}">
         <div style="min-width:0"><div class="card-t"><span class="wo">WO ${esc(o.wo)}</span><span class="status ${st[1]}">${st[0]}</span></div>
-        <div class="meta">${esc(line)}</div><div class="bar"><i style="width:${o.complete.length * 10}%"></i></div></div>
-        <div class="card-r"><div class="big-t">${hm(orderMs(o) / 6e4)}</div><div class="small">${o.complete.length} of 10 stages</div>${nn ? `<div class="tiny">${nn} note${nn > 1 ? 's' : ''}</div>` : ''}</div>
+        <div class="meta">${esc(line)}</div><div class="bar"><i style="width:${prog.pct}%"></i></div></div>
+        <div class="card-r"><div class="big-t">${hm(orderMs(o) / 6e4)}</div><div class="small">${prog.done} of ${prog.total} stages</div>${nn ? `<div class="tiny">${nn} note${nn > 1 ? 's' : ''}</div>` : ''}</div>
       </button>`;
     }).join('')}</div>` : `<div class="empty">${shop.length ? 'No works orders match this filter.' : 'Nothing open. Start a works order to begin timing.'}</div>`}
   </div></div>`;
@@ -1172,7 +1665,10 @@ function vNew() {
         <input class="field" id="f-cust" data-f="cust" value="${esc(S.cust)}" placeholder="Customer name" autocomplete="off">
         ${picks.length ? `<div class="tiny" style="margin-top:10px">Most used</div><div class="chips">${picks.map(c => `<button class="chip" data-a="pickcust" data-name="${esc(c)}">${esc(c)}</button>`).join('')}</div>` : ''}
         <div class="lbl sec">Machine to build</div>
-        <div class="machines">${MACHINES.map(m => `<button class="opt ${S.machine === m.name ? 'on' : ''}" data-a="machine" data-name="${esc(m.name)}"><span>${esc(m.name)}</span><small>${m.hasRef ? 'Ref times' : 'No ref yet'}</small></button>`).join('')}</div>
+        <div class="machines">${machineList().map(m => {
+          const has = processStages(m.name).some(s => s.ref != null);
+          return `<button class="opt ${S.machine === m.name ? 'on' : ''}" data-a="machine" data-name="${esc(m.name)}"><span>${esc(m.name)}</span><small>${has ? 'Ref times' : 'No ref yet'}</small></button>`;
+        }).join('')}</div>
         <div class="qtyrow sec">
           <div><div class="lbl">Quantity</div><div class="stepper"><button class="step" data-a="qtydown" aria-label="Less">−</button><div class="qty">${S.qty}</div><button class="step" data-a="qtyup" aria-label="More">+</button></div></div>
           ${S.qty > 1 ? `<div><div class="lbl">How do you want to time it?</div><div class="modes">
@@ -1189,9 +1685,10 @@ function vNew() {
 
 function vStages(o) {
   const pu = perUnit(o); const uf = pu ? S.unit : null;
-  const remaining = 10 - o.complete.length;
+  const prog = stageProgress(o);
+  const remaining = prog.total - prog.done;
   const hint = o.done ? 'Finished ' + hhmm(o.finishedAt) + ' · included in tonight\u2019s report'
-    : remaining ? remaining + ' stage' + (remaining > 1 ? 's' : '') + ' still to complete. Stages can be done in any order.' : 'All 10 stages complete.';
+    : remaining ? remaining + ' stage' + (remaining > 1 ? 's' : '') + ' still to complete. Stages can be done in any order.' : 'All ' + prog.total + ' stages complete.';
   const notes = o.notes.slice().reverse();
   const orderTally = tallyRanges(collectRanges(o, null, null, false));
   const orderBreak = breakText(orderTally);
@@ -1204,7 +1701,7 @@ function vStages(o) {
       </div>
     </div>
     <div class="scroll" data-scroll="stages"><div class="pad" style="padding-top:16px">
-      <div class="stagelist">${STAGES.map(s => {
+      <div class="stagelist">${orderStages(o).map(s => {
         const done = o.complete.includes(s.n);
         const run = o.active && o.active.stage === s.n && (!pu || o.active.unit === S.unit);
         const tally = tallyRanges(collectRanges(o, s.n, uf, false));
@@ -1213,14 +1710,14 @@ function vStages(o) {
         const cost = costText(tally);
         const chip = run ? ['Running','run'] : done ? ['Complete','done'] : t > 0 ? ['Paused','prog'] : ['Not started',''];
         const liveCounted = run ? spanCount(woActiveStart(o.active), Date.now()).counted : 0;
-        return `<div class="srow ${run ? 'run' : ''} ${done ? 'done' : ''}" style="border-left-color:${s.colour}">
+        return `<div class="srow ${run ? 'run' : ''} ${done ? 'done' : ''} ${s.extra ? 'extra' : ''}" style="border-left-color:${s.colour}">
           <button class="sopen" data-a="stage" data-n="${s.n}">
             <span class="snum">${s.n}</span>
-            <span style="min-width:0"><span class="sfn" style="color:${s.colour}">${s.fn}</span><span class="sname">${esc(s.name)}</span></span>
-            <span class="stime"><b>${t > 0 ? hm(t / 6e4) : '—'}</b><small>${o.hasRef ? 'ref ' + hm(s.ref) : 'no ref'}</small>${brk ? `<small class="brk">${esc(brk)}</small>` : ''}${cost ? `<small class="cost">${esc(cost)}</small>` : ''}</span>
+            <span style="min-width:0"><span class="sfn" style="color:${s.colour}">${s.fn}</span><span class="sname">${esc(s.name)}</span>${s.extra ? '<span class="sextra">Not on this machine</span>' : ''}</span>
+            <span class="stime"><b>${t > 0 ? hm(t / 6e4) : '—'}</b><small>${refText(s.ref)}</small>${brk ? `<small class="brk">${esc(brk)}</small>` : ''}${cost ? `<small class="cost">${esc(cost)}</small>` : ''}</span>
             <span class="schip ${chip[1]}">${chip[0]}</span>
           </button>
-          <button class="sgo ${run ? 'on' : ''}" data-a="stagetoggle" data-n="${s.n}">${run ? 'Stop<small>' + clock(liveCounted) + '</small>' : 'Start'}</button>
+          ${s.extra && !run ? '' : `<button class="sgo ${run ? 'on' : ''}" data-a="stagetoggle" data-n="${s.n}">${run ? 'Stop<small>' + clock(liveCounted) + '</small>' : 'Start'}</button>`}
         </div>`;
       }).join('')}</div>
       <div class="notes">
@@ -1234,7 +1731,9 @@ function vStages(o) {
 }
 
 function vTimer(o) {
-  const s = stageOf(S.stage); const pu = perUnit(o); const uf = pu ? S.unit : null;
+  const s = orderStages(o).find(x => x.n === S.stage) || stageOf(S.stage);
+  if (!s) return '<div class="pad"><div class="empty">This stage is no longer on the list.</div></div>';
+  const pu = perUnit(o); const uf = pu ? S.unit : null;
   const run = o.active && o.active.stage === s.n && (!pu || o.active.unit === S.unit);
   const done = o.complete.includes(s.n);
   const tally = tallyRanges(collectRanges(o, s.n, uf, false));
@@ -1242,7 +1741,7 @@ function vTimer(o) {
   const liveStart = run ? woActiveStart(o.active) : 0;
   const liveSpan = run ? spanCount(liveStart, Date.now()) : null;
   const runs = o.runs.filter(r => r.stage === s.n && (!pu || r.unit === S.unit));
-  const ref = o.hasRef ? 'Reference ' + hm(s.ref) + '  ·  counted so far ' + hm(t / 6e4) : 'No reference time for this model  ·  counted so far ' + hm(t / 6e4);
+  const ref = s.ref == null ? 'No reference time for this stage  ·  counted so far ' + hm(t / 6e4) : 'Reference ' + hm(s.ref) + '  ·  counted so far ' + hm(t / 6e4);
   const overtime = shopClosed() ? ' Overtime after 4:30pm still logs until you press Stop.' : '';
   const brk = breakText(tally);
   const cost = costText(tally);
@@ -1271,8 +1770,8 @@ function vTimer(o) {
       <button class="complete ${done ? 're' : ''}" data-a="complete">${done ? 'Reopen stage' : 'Mark stage complete'}</button>
     </div>
     <div class="tside">
-      <button class="ss ${run ? 'on' : ''}" data-a="toggle">${run ? 'Stop' : 'Start'}</button>
-      <div class="tasks"><div class="lbl">Key tasks</div>${s.tasks.map(x => `<div class="task">${esc(x)}</div>`).join('')}</div>
+      <button class="ss ${run ? 'on' : ''}" data-a="toggle" ${s.extra && !run ? 'disabled' : ''}>${s.extra && !run ? 'Not on this machine' : run ? 'Stop' : 'Start'}</button>
+      <div class="tasks"><div class="lbl">Key tasks</div>${(s.tasks || []).map(x => `<div class="task">${esc(x)}</div>`).join('')}</div>
       <div class="runs"><div class="runs-h"><span class="lbl">Runs</span><span>${runs.length + (run ? 1 : 0)} run${runs.length + (run ? 1 : 0) === 1 ? '' : 's'}</span></div>
         ${isOffice() ? `<div class="run-tools"><button class="pill pill-o atbl-b" data-a="runadd">Add time</button></div>` : ''}
         ${editing ? `<div class="run-form">
@@ -1305,19 +1804,20 @@ function vTimer(o) {
 function vFinish(o) {
   const orderTally = tallyRanges(collectRanges(o, null, null, false));
   const total = orderTally.counted / 6e4;
-  const budget = o.hasRef ? FIXED_BUDGET_100T : null;
-  const refTotal = o.hasRef ? STAGES.reduce((a, s) => a + s.ref, 0) : null;
-  const line = budget == null ? 'No reference times exist for this model yet — this build becomes the first recorded set.'
-    : (total >= budget ? '+' : '−') + hm(Math.abs(total - budget)) + ' against the fixed budget of ' + hm(budget) + '.';
+  const stages = orderStages(o);
+  const refs = stages.filter(s => !s.extra && s.ref != null).map(s => Number(s.ref));
+  const refTotal = refs.length ? refs.reduce((a, n) => a + n, 0) : null;
+  const line = refTotal == null ? 'No reference times for this machine yet.'
+    : (total >= refTotal ? '+' : '−') + hm(Math.abs(total - refTotal)) + ' against the reference of ' + hm(refTotal) + '.';
   const brk = breakText(orderTally);
   const cost = costText(orderTally);
   return `<div class="pad" style="padding-bottom:12px;flex:none"><h2 class="h2" style="font-size:26px">Finish job · WO ${esc(o.wo)}</h2><div class="meta" style="margin-top:6px">${esc([o.customer, o.machine, 'Qty ' + o.qty].join('  ·  '))}</div></div>
     <div class="scroll" data-scroll="finish"><div style="padding:0 26px 20px">
       <div class="tbl h"><span>#</span><span>Process stage</span><span class="r">Reference</span><span class="r">Counted</span></div>
-      ${STAGES.map(s => {
+      ${stages.map(s => {
         const tally = tallyRanges(collectRanges(o, s.n, null, false));
         const ded = breakText(tally);
-        return `<div class="tbl"><span class="n">${s.n}</span><span>${esc(s.name)}${ded ? `<small class="brk" style="display:block;margin-top:4px">${esc(ded)}</small>` : ''}</span><span class="r" style="color:var(--g3)">${o.hasRef ? hm(s.ref) : '—'}</span><span class="r" style="font-weight:700">${hm(tally.counted / 6e4)}</span></div>`;
+        return `<div class="tbl"><span class="n">${s.n}</span><span>${esc(s.name)}${s.extra ? ' <small class="sextra">Not on this machine</small>' : ''}${ded ? `<small class="brk" style="display:block;margin-top:4px">${esc(ded)}</small>` : ''}</span><span class="r" style="color:var(--g3)">${s.ref == null ? '—' : hm(s.ref)}</span><span class="r" style="font-weight:700">${hm(tally.counted / 6e4)}</span></div>`;
       }).join('')}
       <div class="tbl t"><span></span><span style="font:900 12px/1 var(--font);letter-spacing:.08em;text-transform:uppercase">Works order total</span><span class="r" style="color:var(--g3)">${refTotal == null ? '—' : hm(refTotal)}</span><span class="r" style="font-weight:900;font-size:16px">${hm(total)}</span></div>
       ${brk ? `<div class="brk" style="margin-top:10px">${esc(brk)}</div>` : ''}
@@ -1337,7 +1837,7 @@ function vReport() {
       <div class="meta">Sent automatically each weekday evening as an Excel file to ${esc(CFG.reportEmail || 'the Production Manager')}. This is today\u2019s preview.</div></div>
     <div class="sheet-b">
       ${touched.length ? touched.map(o => {
-        const rows = STAGES.filter(s => tallyRanges(collectRanges(o, s.n, null, true)).elapsed > 0);
+        const rows = orderStages(o).filter(s => tallyRanges(collectRanges(o, s.n, null, true)).elapsed > 0);
         const dayTally = tallyRanges(collectRanges(o, null, null, true));
         const tot = dayTally.counted / 6e4;
         const brk = breakText(dayTally);
@@ -1408,10 +1908,20 @@ root.addEventListener('click', e => {
 root.addEventListener('input', e => {
   const f = e.target.dataset.f; if (!f || e.target.tagName === 'SELECT') return;
   S[f] = e.target.value;
+  if (e.target.type === 'color') return;
   if (f === 'pass' || f === 'teamPass' || f === 'intSecret' || f === 'intTestTo' || f === 'teamRate' || f === 'runStart' || f === 'runStop') { S.unlockError = ''; return; }
   render();
 });
 root.addEventListener('change', e => {
+  if (e.target.dataset && e.target.dataset.ref != null) {
+    actions.procref({ n: e.target.dataset.ref, value: e.target.value });
+    return;
+  }
+  if (e.target.type === 'color' && e.target.dataset.f) {
+    S[e.target.dataset.f] = String(e.target.value || '').toLowerCase();
+    render();
+    return;
+  }
   const f = e.target.dataset.f; if (!f || e.target.tagName !== 'SELECT') return;
   S[f] = e.target.value;
   render();
@@ -1430,7 +1940,7 @@ setInterval(() => {
   greetShown = g;
   const liveShop = S.orders.some(o => o.active);
   const liveAdmin = S.screen === 'admin' && S.adminTab === 'orders' && ((S.woList || []).some(r => r.active) || S.orders.some(o => o.active));
-  const choosing = document.activeElement && document.activeElement.tagName === 'SELECT';
+  const choosing = document.activeElement && /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
   if ((liveShop || liveAdmin || greetChanged) && !S.runEdit && !choosing) render();
 }, 1000);
 setInterval(() => { if (S.unlocked || S.handover) flush().then(pull); }, 60000);
@@ -1451,6 +1961,7 @@ async function restoreUser(user) {
   applyCloseOfDay();
   render();
   flush().then(pull);
+  loadProcess();
 }
 
 async function boot() {
